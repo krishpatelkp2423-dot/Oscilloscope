@@ -1,0 +1,454 @@
+// ============================================================================
+//  DIY Oscilloscope firmware — Seeed Studio XIAO ESP32 (C3 / S3 / C6)
+//
+//  Three acquisition paths share one level-shifting front end:
+//    V1 AUTO   — window comparators + CD4052 pick a gain band in hardware;
+//                firmware reads the band and divides the gain back out.
+//    V2 DIRECT — level-shifted signal straight into the ESP32 ADC.
+//    V3 EXT    — ADS8681 16-bit SAR ADC over SPI (driver in ads8681.cpp).
+//
+//  Data and control go over the USB serial port. Send HELP for the command
+//  list. FORMAT CSV (the default) prints Arduino Serial Plotter-friendly text;
+//  FORMAT BIN switches to the framed binary stream used by host/scope_gui.py.
+//
+//  Board-specific pins and gains: board_config.h
+// ============================================================================
+#include <Arduino.h>
+#include <math.h>
+#include <stdarg.h>
+
+#include "ads8681.h"
+#include "board_config.h"
+#include "protocol.h"
+#include "scope.h"
+#include "settings.h"
+
+#define FIRMWARE_VERSION "1.0.0"
+
+namespace {
+
+Settings g_cfg;
+Capture g_cap;
+bool g_running = false;
+bool g_single = false;
+bool g_binary = false;  // FORMAT BIN vs CSV; not persisted so a fresh boot is human-readable
+uint32_t g_seq = 0;
+
+char g_line[128];
+size_t g_line_len = 0;
+bool g_line_overflow = false;
+
+// ---------------------------------------------------------------------------
+//  Output helpers
+// ---------------------------------------------------------------------------
+
+void reply(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void reply(const char* fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+  if (g_binary) {
+    proto::sendText(Serial, buf);
+  } else {
+    Serial.println(buf);
+  }
+}
+
+bool serialPending() { return Serial.available() > 0; }
+
+void sendCaptureBinary(bool single) {
+  proto::WaveformHeader h = {};
+  h.seq = g_seq++;
+  h.mode = g_cfg.mode;
+  h.nch = g_cap.nch;
+  h.flags = (g_cap.trig_index >= 0 ? proto::FLAG_TRIGGERED : 0) |
+            (g_cap.has_bands ? proto::FLAG_HAS_BANDS : 0) |
+            (single ? proto::FLAG_SINGLE : 0);
+  h.trig_src = g_cfg.trig_src;
+  h.nsamples = g_cap.n;
+  h.trig_index = g_cap.trig_index;
+  h.sample_rate = g_cap.sample_rate;
+  h.trig_level = g_cfg.trig_level;
+  memset(h.ch_id, 0xFF, sizeof h.ch_id);
+  for (uint8_t k = 0; k < g_cap.nch; k++) h.ch_id[k] = g_cap.ch[k];
+
+  const uint32_t data_bytes = (uint32_t)g_cap.nch * g_cap.n * sizeof(float);
+  const uint32_t len = sizeof h + data_bytes + (g_cap.has_bands ? g_cap.n : 0);
+  proto::PacketWriter w(Serial, proto::PKT_WAVEFORM, len);
+  w.write(&h, sizeof h);
+  for (uint8_t k = 0; k < g_cap.nch; k++) {
+    w.write(g_cap.data[g_cap.ch[k]], g_cap.n * sizeof(float));
+  }
+  if (g_cap.has_bands) w.write(g_cap.bands, g_cap.n);
+  w.finish();
+}
+
+// One "label:value,label:value" line per sample: the Arduino IDE Serial
+// Plotter draws each label as its own trace.
+void sendCaptureCsv() {
+  static const char* const labels[NUM_CHANNELS] = {"auto", "direct", "ext"};
+  char line[96];
+  for (uint32_t i = 0; i < g_cap.n; i++) {
+    int pos = 0;
+    for (uint8_t k = 0; k < g_cap.nch && pos < (int)sizeof line; k++) {
+      uint8_t ch = g_cap.ch[k];
+      pos += snprintf(line + pos, sizeof line - pos, "%s%s:%.5f", k ? "," : "", labels[ch],
+                      g_cap.data[ch][i]);
+    }
+    if (g_cap.has_bands && pos < (int)sizeof line) {
+      pos += snprintf(line + pos, sizeof line - pos, ",band:%u", g_cap.bands[i]);
+    }
+    Serial.println(line);
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Info / help
+// ---------------------------------------------------------------------------
+
+void printHelp() {
+  reply("Commands (case-insensitive):");
+  reply("  RUN | STOP | SINGLE         start, stop, or capture one triggered frame");
+  reply("  MODE AUTO|DIRECT|EXT|ALL    acquisition path(s): V1, V2, V3, or all three");
+  reply("  RATE <Hz>                   sample rate (actual rate is measured per frame)");
+  reply("  N <samples>                 record length, %u..%u", (unsigned)MIN_SAMPLES,
+        (unsigned)MAX_SAMPLES);
+  reply("  TRIG FREE|AUTO|NORMAL       trigger mode");
+  reply("  EDGE RISING|FALLING         trigger edge");
+  reply("  LEVEL <V> | HYST <V>        trigger level / hysteresis, input-referred volts");
+  reply("  SRC AUTO|DIRECT|EXT|HW      trigger source (HW = LPV7215 comparator pin)");
+  reply("  PRE <0-100>                 pre-trigger percentage of the record");
+  reply("  FORMAT CSV|BIN              text for Serial Plotter / binary for scope_gui.py");
+  reply("  ADSRANGE <code>             ADS8681 range: 0-4 bipolar, 8-11 unipolar (0xB=0..5.12V)");
+  reply("  GAIN <code 0-3> <gain>      auto-range gain for a CD4052 select code");
+  reply("  PGAIN AUTO|DIRECT|EXT <g>   path gain, input -> ADC node");
+  reply("  MID AUTO|DIRECT|EXT <V>     ADC-node voltage that means 0 V at the input");
+  reply("  CAL ZERO                    input shorted to GND: measure every mid-point");
+  reply("  CAL GAIN <V>                known DC input applied: measure path/band gains");
+  reply("  PROBE                       raw reading of every net (board bring-up)");
+  reply("  INFO | SAVE | LOAD | DEFAULTS");
+}
+
+void printInfo() {
+  char range[24];
+  ADS8681::describeRange(g_cfg.ads_range, range, sizeof range);
+  reply("Oscilloscope fw %s | %s @ %u MHz | arduino-esp32 %d.%d.%d", FIRMWARE_VERSION,
+        ESP.getChipModel(), (unsigned)getCpuFrequencyMhz(), ESP_ARDUINO_VERSION_MAJOR,
+        ESP_ARDUINO_VERSION_MINOR, ESP_ARDUINO_VERSION_PATCH);
+  reply("mode=%s rate=%lu n=%lu trig=%s edge=%s src=%s level=%.4f hyst=%.4f pre=%u%%",
+        modeName(g_cfg.mode), (unsigned long)g_cfg.sample_rate, (unsigned long)g_cfg.nsamples,
+        trigModeName(g_cfg.trig_mode), g_cfg.trig_edge == EDGE_RISING ? "RISING" : "FALLING",
+        channelName(g_cfg.trig_src), g_cfg.trig_level, g_cfg.trig_hyst, g_cfg.pretrig_pct);
+  reply("state=%s format=%s", g_running ? "RUN" : "STOP", g_binary ? "BIN" : "CSV");
+  reply("paths: AUTO=%s DIRECT=%s EXT=%s (ADS8681 %s, range %s)",
+        scopeChannelAvailable(CH_AUTO) ? "yes" : "no",
+        scopeChannelAvailable(CH_DIRECT) ? "yes" : "no",
+        scopeChannelAvailable(CH_EXT) ? "yes" : "no",
+        scopeAdsPresent() ? "detected" : "NOT detected", range);
+  reply("cal mid: auto=%.4f direct=%.4f ext=%.4f V", g_cfg.mid_v[CH_AUTO],
+        g_cfg.mid_v[CH_DIRECT], g_cfg.mid_v[CH_EXT]);
+  reply("cal path gain: auto=%.4f direct=%.4f ext=%.4f", g_cfg.path_gain[CH_AUTO],
+        g_cfg.path_gain[CH_DIRECT], g_cfg.path_gain[CH_EXT]);
+  reply("cal band gain: 0=%.4f 1=%.4f 2=%.4f 3=%.4f", g_cfg.band_gain[0], g_cfg.band_gain[1],
+        g_cfg.band_gain[2], g_cfg.band_gain[3]);
+  reply("pins: direct=%d auto=%d bandA=%d bandB=%d hwtrig=%d ads cs=%d rst=%d sck=%d miso=%d "
+        "mosi=%d (GPIO numbers)",
+        PIN_ADC_DIRECT, PIN_ADC_AUTO, PIN_BAND_A, PIN_BAND_B, PIN_HW_TRIGGER, PIN_ADS_CS,
+        PIN_ADS_RST, PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+}
+
+// Live raw readings of every net, to check the pin map against the board:
+// with the input grounded each ADC node should read about 1.65 V.
+void probe() {
+  if (!scopeAdsPresent()) scopeAdsRedetect(g_cfg.ads_range);
+  RawReading rd;
+  if (scopeMeasureRaw(CH_DIRECT, 256, rd)) {
+    reply("PROBE direct: node=%.4f V (min %.4f max %.4f) -> input %+.4f V", rd.mean_v, rd.min_v,
+          rd.max_v, (rd.mean_v - g_cfg.mid_v[CH_DIRECT]) / g_cfg.path_gain[CH_DIRECT]);
+  }
+  if (scopeMeasureRaw(CH_AUTO, 256, rd)) {
+    float gain = g_cfg.path_gain[CH_AUTO] * g_cfg.band_gain[rd.band];
+    reply("PROBE auto: node=%.4f V (min %.4f max %.4f) band=%u%s gain=%.3f -> input %+.4f V",
+          rd.mean_v, rd.min_v, rd.max_v, rd.band, rd.band_stable ? "" : " (changing)", gain,
+          (rd.mean_v - g_cfg.mid_v[CH_AUTO]) / gain);
+  }
+  if (scopeMeasureRaw(CH_EXT, 256, rd)) {
+    reply("PROBE ext: code=0x%04X node=%.5f V (min %.5f max %.5f) -> input %+.5f V", rd.last_code,
+          rd.mean_v, rd.min_v, rd.max_v,
+          (rd.mean_v - g_cfg.mid_v[CH_EXT]) / g_cfg.path_gain[CH_EXT]);
+  } else {
+    reply("PROBE ext: ADS8681 not detected (check CS/SCK/MISO/MOSI, 5 V AVDD, 3.3 V DVDD)");
+  }
+  reply("PROBE pins: bandA=%d bandB=%d hwtrig=%d", (scopeReadBand() & 1) ? 1 : 0,
+        (scopeReadBand() & 2) ? 1 : 0, scopeReadHwTrigger() ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
+//  Calibration
+// ---------------------------------------------------------------------------
+
+void calZero() {
+  bool any = false;
+  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
+    RawReading rd;
+    if (!scopeMeasureRaw(ch, 2048, rd)) continue;
+    g_cfg.mid_v[ch] = rd.mean_v;
+    any = true;
+    reply("CAL ZERO %s: mid=%.5f V (noise p-p %.2f mV)", channelName(ch), rd.mean_v,
+          (rd.max_v - rd.min_v) * 1000.0f);
+  }
+  reply(any ? "OK CAL ZERO done; SAVE to keep it" : "ERR no channels to calibrate");
+}
+
+void calGain(float known_v) {
+  if (!isfinite(known_v) || fabsf(known_v) < 0.05f) {
+    reply("ERR apply and pass a known DC voltage of at least 50 mV, e.g. CAL GAIN 1.000");
+    return;
+  }
+  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
+    RawReading rd;
+    if (!scopeMeasureRaw(ch, 2048, rd)) continue;
+    float delta = rd.mean_v - g_cfg.mid_v[ch];
+    if (fabsf(delta) < 0.01f) {
+      reply("CAL GAIN %s: skipped, node moved only %.1f mV from mid", channelName(ch),
+            delta * 1000.0f);
+      continue;
+    }
+    if (ch == CH_AUTO) {
+      if (!rd.band_stable) {
+        reply("CAL GAIN AUTO: skipped, band changed during the measurement");
+        continue;
+      }
+      g_cfg.band_gain[rd.band] = delta / (known_v * g_cfg.path_gain[CH_AUTO]);
+      reply("CAL GAIN AUTO: band %u gain=%.4f", rd.band, g_cfg.band_gain[rd.band]);
+    } else {
+      g_cfg.path_gain[ch] = delta / known_v;
+      reply("CAL GAIN %s: path gain=%.4f", channelName(ch), g_cfg.path_gain[ch]);
+    }
+  }
+  reply("OK CAL GAIN done; SAVE to keep it");
+}
+
+// ---------------------------------------------------------------------------
+//  Command parsing
+// ---------------------------------------------------------------------------
+
+bool parseFloat(const char* tok, float& out) {
+  if (!tok) return false;
+  char* end;
+  out = strtof(tok, &end);
+  return end != tok && *end == '\0' && isfinite(out);
+}
+
+bool parseUint(const char* tok, uint32_t& out) {
+  if (!tok || *tok == '-') return false;
+  char* end;
+  out = strtoul(tok, &end, 0);  // base 0: accepts 11, 0xB, ...
+  return end != tok && *end == '\0';
+}
+
+int lookup(const char* tok, const char* const* names, int count) {
+  if (!tok) return -1;
+  for (int i = 0; i < count; i++) {
+    if (strcasecmp(tok, names[i]) == 0) return i;
+  }
+  return -1;
+}
+
+const char* const kModeNames[] = {"AUTO", "DIRECT", "EXT", "ALL"};
+const char* const kTrigNames[] = {"FREE", "AUTO", "NORMAL"};
+const char* const kEdgeNames[] = {"RISING", "FALLING"};
+const char* const kSrcNames[] = {"AUTO", "DIRECT", "EXT", "HW"};
+
+void handleCommand(char* line) {
+  char* cmd = strtok(line, " \t");
+  if (!cmd) return;
+  char* a1 = strtok(nullptr, " \t");
+  char* a2 = strtok(nullptr, " \t");
+  for (char* p = cmd; *p; p++) *p = toupper(*p);
+
+  uint32_t u;
+  float f;
+  int idx;
+
+  if (!strcmp(cmd, "HELP") || !strcmp(cmd, "?")) {
+    printHelp();
+  } else if (!strcmp(cmd, "INFO")) {
+    printInfo();
+  } else if (!strcmp(cmd, "RUN")) {
+    g_running = true;
+    g_single = false;
+    reply("OK RUN");
+  } else if (!strcmp(cmd, "STOP")) {
+    g_running = false;
+    g_single = false;
+    reply("OK STOP");
+  } else if (!strcmp(cmd, "SINGLE")) {
+    g_running = true;
+    g_single = true;
+    reply("OK SINGLE armed");
+  } else if (!strcmp(cmd, "MODE")) {
+    if ((idx = lookup(a1, kModeNames, MODE_COUNT)) < 0) return reply("ERR MODE AUTO|DIRECT|EXT|ALL");
+    g_cfg.mode = idx;
+    reply("OK MODE %s", modeName(g_cfg.mode));
+  } else if (!strcmp(cmd, "RATE")) {
+    if (!parseUint(a1, u) || u < MIN_SAMPLE_RATE || u > MAX_SAMPLE_RATE) {
+      return reply("ERR RATE %lu..%lu", (unsigned long)MIN_SAMPLE_RATE,
+                   (unsigned long)MAX_SAMPLE_RATE);
+    }
+    g_cfg.sample_rate = u;
+    reply("OK RATE %lu", (unsigned long)u);
+  } else if (!strcmp(cmd, "N")) {
+    if (!parseUint(a1, u) || u < MIN_SAMPLES || u > MAX_SAMPLES) {
+      return reply("ERR N %u..%u", (unsigned)MIN_SAMPLES, (unsigned)MAX_SAMPLES);
+    }
+    g_cfg.nsamples = u;
+    reply("OK N %lu", (unsigned long)u);
+  } else if (!strcmp(cmd, "TRIG")) {
+    if ((idx = lookup(a1, kTrigNames, 3)) < 0) return reply("ERR TRIG FREE|AUTO|NORMAL");
+    g_cfg.trig_mode = idx;
+    reply("OK TRIG %s", trigModeName(idx));
+  } else if (!strcmp(cmd, "EDGE")) {
+    if ((idx = lookup(a1, kEdgeNames, 2)) < 0) return reply("ERR EDGE RISING|FALLING");
+    g_cfg.trig_edge = idx;
+    reply("OK EDGE %s", kEdgeNames[idx]);
+  } else if (!strcmp(cmd, "LEVEL")) {
+    if (!parseFloat(a1, f)) return reply("ERR LEVEL <volts>");
+    g_cfg.trig_level = f;
+    reply("OK LEVEL %.4f", f);
+  } else if (!strcmp(cmd, "HYST")) {
+    if (!parseFloat(a1, f) || f < 0) return reply("ERR HYST <volts >= 0>");
+    g_cfg.trig_hyst = f;
+    reply("OK HYST %.4f", f);
+  } else if (!strcmp(cmd, "SRC")) {
+    if ((idx = lookup(a1, kSrcNames, 4)) < 0) return reply("ERR SRC AUTO|DIRECT|EXT|HW");
+    g_cfg.trig_src = idx;
+    reply("OK SRC %s", channelName(idx));
+  } else if (!strcmp(cmd, "PRE")) {
+    if (!parseUint(a1, u) || u > 100) return reply("ERR PRE 0..100");
+    g_cfg.pretrig_pct = u;
+    reply("OK PRE %lu", (unsigned long)u);
+  } else if (!strcmp(cmd, "FORMAT")) {
+    if (a1 && !strcasecmp(a1, "BIN")) {
+      g_binary = true;
+    } else if (a1 && !strcasecmp(a1, "CSV")) {
+      g_binary = false;
+    } else {
+      return reply("ERR FORMAT CSV|BIN");
+    }
+    reply("OK FORMAT %s", g_binary ? "BIN" : "CSV");
+  } else if (!strcmp(cmd, "ADSRANGE")) {
+    if (!parseUint(a1, u) || !ADS8681::isValidRange(u)) return reply("ERR ADSRANGE 0-4 or 8-11");
+    if (!scopeAdsSetRange(u)) return reply("ERR ADS8681 not responding");
+    g_cfg.ads_range = u;
+    char range[24];
+    ADS8681::describeRange(u, range, sizeof range);
+    reply("OK ADSRANGE 0x%lX (%s)", (unsigned long)u, range);
+  } else if (!strcmp(cmd, "GAIN")) {
+    if (!parseUint(a1, u) || u > 3 || !parseFloat(a2, f) || f == 0.0f) {
+      return reply("ERR GAIN <code 0-3> <gain>");
+    }
+    g_cfg.band_gain[u] = f;
+    reply("OK GAIN %lu %.4f", (unsigned long)u, f);
+  } else if (!strcmp(cmd, "PGAIN")) {
+    if ((idx = lookup(a1, kSrcNames, NUM_CHANNELS)) < 0 || !parseFloat(a2, f) || f == 0.0f) {
+      return reply("ERR PGAIN AUTO|DIRECT|EXT <gain>");
+    }
+    g_cfg.path_gain[idx] = f;
+    reply("OK PGAIN %s %.4f", channelName(idx), f);
+  } else if (!strcmp(cmd, "MID")) {
+    if ((idx = lookup(a1, kSrcNames, NUM_CHANNELS)) < 0 || !parseFloat(a2, f)) {
+      return reply("ERR MID AUTO|DIRECT|EXT <volts>");
+    }
+    g_cfg.mid_v[idx] = f;
+    reply("OK MID %s %.4f", channelName(idx), f);
+  } else if (!strcmp(cmd, "CAL")) {
+    if (a1 && !strcasecmp(a1, "ZERO")) {
+      calZero();
+    } else if (a1 && !strcasecmp(a1, "GAIN") && parseFloat(a2, f)) {
+      calGain(f);
+    } else {
+      reply("ERR CAL ZERO | CAL GAIN <volts>");
+    }
+  } else if (!strcmp(cmd, "PROBE")) {
+    probe();
+  } else if (!strcmp(cmd, "SAVE")) {
+    reply(settingsSave(g_cfg) ? "OK SAVE" : "ERR SAVE failed");
+  } else if (!strcmp(cmd, "LOAD")) {
+    if (!settingsLoad(g_cfg)) return reply("ERR nothing saved");
+    scopeAdsSetRange(g_cfg.ads_range);
+    reply("OK LOAD");
+  } else if (!strcmp(cmd, "DEFAULTS")) {
+    settingsDefaults(g_cfg);
+    settingsErase();
+    scopeAdsSetRange(g_cfg.ads_range);
+    reply("OK DEFAULTS (saved settings erased)");
+  } else {
+    reply("ERR unknown command '%s' (try HELP)", cmd);
+  }
+}
+
+void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (!g_line_overflow && g_line_len > 0) {
+        g_line[g_line_len] = '\0';
+        handleCommand(g_line);
+      }
+      g_line_len = 0;
+      g_line_overflow = false;
+    } else if (g_line_len < sizeof g_line - 1) {
+      g_line[g_line_len++] = c;
+    } else {
+      g_line_overflow = true;
+    }
+  }
+}
+
+}  // namespace
+
+void setup() {
+  Serial.begin(921600);  // the baud rate is ignored over native USB
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 1500) delay(10);
+
+  settingsDefaults(g_cfg);
+  bool loaded = settingsLoad(g_cfg);
+  scopeBegin(g_cfg);
+
+  reply("Oscilloscope fw %s ready (%s settings). Send HELP for commands, RUN to start.",
+        FIRMWARE_VERSION, loaded ? "saved" : "default");
+  if (!scopeAdsPresent()) reply("WARN ADS8681 not detected; EXT path disabled");
+}
+
+void loop() {
+  pollSerial();
+  if (!g_running) {
+    delay(2);
+    return;
+  }
+
+  // SINGLE waits for a real trigger even when the trigger mode is AUTO.
+  uint8_t trig_mode = g_cfg.trig_mode;
+  if (g_single && trig_mode == TRIG_AUTO) trig_mode = TRIG_NORMAL;
+
+  AcqResult r = acquire(g_cfg, trig_mode, serialPending, g_cap);
+  if (r == AcqResult::Ok) {
+    if (g_binary) {
+      sendCaptureBinary(g_single);
+    } else {
+      sendCaptureCsv();
+    }
+    if (g_single) {
+      g_running = false;
+      g_single = false;
+    }
+  } else if (r == AcqResult::NoChannels) {
+    reply("ERR mode %s has no working channel on this board; stopping", modeName(g_cfg.mode));
+    g_running = false;
+  }
+  delay(1);  // let lower-priority tasks run between frames
+}
