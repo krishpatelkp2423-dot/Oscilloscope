@@ -24,7 +24,8 @@ uint8_t g_band[MAX_SAMPLES];
 struct Recon {
   float direct_mid, direct_inv_gain;
   float ext_mid, ext_inv_gain;
-  uint8_t nstages;             // stages to try, highest |gain| first
+  float idle;                  // stage output when its mux channel is off
+  uint8_t nstages;             // enabled stages, highest |gain| first
   uint8_t order[NUM_STAGES];
   float stage_off[NUM_STAGES];
   float stage_inv_gain[NUM_STAGES];
@@ -32,6 +33,7 @@ struct Recon {
   float win_hi[NUM_STAGES];
   float hole_lo[NUM_STAGES];
   float hole_hi[NUM_STAGES];
+  bool center_ok[NUM_STAGES];
 };
 
 // One time-aligned sample of every active input.
@@ -46,6 +48,7 @@ Recon makeRecon(const Settings& s) {
   r.direct_inv_gain = 1.0f / s.direct_gain;
   r.ext_mid = s.ext_mid_v;
   r.ext_inv_gain = 1.0f / s.ext_gain;
+  r.idle = s.stage_idle_v;
   for (uint8_t b = 0; b < NUM_STAGES; b++) {
     r.stage_off[b] = s.stage_off_v[b];
     r.stage_inv_gain[b] = 1.0f / s.stage_gain[b];
@@ -53,6 +56,7 @@ Recon makeRecon(const Settings& s) {
     r.win_hi[b] = s.window_hi_v[b];
     r.hole_lo[b] = s.hole_lo_v[b];
     r.hole_hi[b] = s.hole_hi_v[b];
+    r.center_ok[b] = s.stage_center_ok[b];
     if (kStagePin[b] >= 0 && s.window_lo_v[b] < s.window_hi_v[b]) r.order[r.nstages++] = b;
   }
   if (r.nstages == 2 && fabsf(s.stage_gain[r.order[1]]) > fabsf(s.stage_gain[r.order[0]])) {
@@ -67,28 +71,41 @@ inline float readDirect(const Recon& r) {
   return (nativeVolts(PIN_ADC_DIRECT) - r.direct_mid) * r.direct_inv_gain;
 }
 
-// V1 auto-range. The XIAO can't see the mux select lines, so it decides which
-// gain stage is live from the readings: try the highest-gain stage whose
-// window (minus its hole) contains the direct reading x, and accept it only if
-// its value is in the ADC's linear range and agrees with the direct path. The direct path is
-// read again after the stage so the comparison uses the average of two reads
-// taken either side of it, which cancels the signal's slope to first order.
-// If no stage qualifies, fall back to the direct reading (band 0).
-inline float readAutoPath(const Recon& r, float x, uint8_t& band) {
+// V1 auto-range. The XIAO can't see the mux select lines, so it works out which
+// gain stage is live from the readings.
+//
+// Every sample uses the same read sequence, so every sample takes the same
+// time: x0 = D2, then each enabled stage (highest gain first), then x1 = D2.
+// A stage read in slot k (of m slots between x0 and x1) is compared with the
+// direct reading interpolated to that slot, x0 + (x1 - x0) * k / m, which
+// cancels the signal's slope to first order.
+//
+// A stage is accepted when the interpolated direct reading lies in its window
+// (outside its hole), its output is in the ADC's linear range, it agrees with
+// the direct reading, and it is not sitting at the idle level (an undriven
+// stage reads as roughly 0 V) unless CAL BANDS confirmed it is driven around
+// its idle point. The highest-gain stage that passes wins; otherwise the
+// sample comes from the direct path (band 0).
+inline float readAutoPath(const Recon& r, float x0, uint8_t& band) {
+  band = 0;
+  if (r.nstages == 0) return x0;
+  float y[NUM_STAGES];
+  for (uint8_t k = 0; k < r.nstages; k++) y[k] = nativeVolts(kStagePin[r.order[k]]);
+  const float x1 = readDirect(r);
+  const float slots = r.nstages + 1.0f;
   for (uint8_t k = 0; k < r.nstages; k++) {
-    uint8_t b = r.order[k];
-    if (x < r.win_lo[b] - AUTO_WINDOW_MARGIN_V || x > r.win_hi[b] + AUTO_WINDOW_MARGIN_V) continue;
-    if (x > r.hole_lo[b] + AUTO_WINDOW_MARGIN_V && x < r.hole_hi[b] - AUTO_WINDOW_MARGIN_V) continue;
-    float y = nativeVolts(kStagePin[b]);
-    if (y < ADC_LINEAR_MIN_V || y > ADC_LINEAR_MAX_V) continue;
-    float v = (y - r.stage_off[b]) * r.stage_inv_gain[b];
-    float x_after = readDirect(r);
-    if (fabsf(v - 0.5f * (x + x_after)) > AUTO_MATCH_TOL_V) continue;
+    const uint8_t b = r.order[k];
+    const float xk = x0 + (x1 - x0) * (k + 1) / slots;
+    if (xk < r.win_lo[b] - AUTO_WINDOW_MARGIN_V || xk > r.win_hi[b] + AUTO_WINDOW_MARGIN_V) continue;
+    if (xk > r.hole_lo[b] + AUTO_WINDOW_MARGIN_V && xk < r.hole_hi[b] - AUTO_WINDOW_MARGIN_V) continue;
+    if (!(y[k] >= ADC_LINEAR_MIN_V && y[k] <= ADC_LINEAR_MAX_V)) continue;
+    if (!r.center_ok[b] && fabsf(y[k] - r.idle) < STAGE_ACTIVE_MIN_V) continue;
+    const float v = (y[k] - r.stage_off[b]) * r.stage_inv_gain[b];
+    if (!(fabsf(v - xk) <= AUTO_MATCH_TOL_V)) continue;
     band = b + 1;
     return v;
   }
-  band = 0;
-  return x;
+  return x0;
 }
 
 inline void readNative(const bool* use, const Recon& r, Sample& s) {
@@ -110,10 +127,9 @@ void configureNativeAdc(int pin) {
 // pass drops points more than 3 sigma from the first fit (mux switching
 // transients).
 //
-// Hole detection: a driven stage only counts as "active" once it is
-// STAGE_ACTIVE_MIN_V from idle, i.e. |x - x0| > STAGE_ACTIVE_MIN_V / |gain|
-// around the input x0 that maps to the idle level. A wider gap in the active
-// inputs around x0 means the stage isn't driven there at all.
+// Hole detection looks for samples that contradict the fit: the stage reads its
+// idle level although, if it were driven, the fit puts it well away from idle.
+// Those inputs are where the mux never selects the stage.
 StageFit fitStage(const float* x, const float* y, uint32_t count, float idle_v) {
   StageFit best;
   float gain = 0.0f, off = 0.0f, sigma = INFINITY;
@@ -121,7 +137,7 @@ StageFit fitStage(const float* x, const float* y, uint32_t count, float idle_v) 
     double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
     float lo = INFINITY, hi = -INFINITY;
     for (uint32_t i = 0; i < count; i++) {
-      if (y[i] < ADC_LINEAR_MIN_V || y[i] > ADC_LINEAR_MAX_V) continue;
+      if (!(y[i] >= ADC_LINEAR_MIN_V && y[i] <= ADC_LINEAR_MAX_V)) continue;
       if (fabsf(y[i] - idle_v) < STAGE_ACTIVE_MIN_V) continue;
       if (pass == 1 && fabsf(y[i] - (off + gain * x[i])) > 3.0f * sigma) continue;
       n += 1;
@@ -152,20 +168,32 @@ StageFit fitStage(const float* x, const float* y, uint32_t count, float idle_v) 
   }
   if (!best.ok) return best;
 
+  float hole_lo = INFINITY, hole_hi = -INFINITY;
+  uint32_t undriven = 0;
+  bool below = false, above = false;  // driven on both sides of the idle point?
   const float x0 = (idle_v - best.off_v) / best.gain;
-  float below = -INFINITY, above = INFINITY;  // nearest active inputs either side of x0
   for (uint32_t i = 0; i < count; i++) {
-    if (y[i] < ADC_LINEAR_MIN_V || y[i] > ADC_LINEAR_MAX_V) continue;
-    if (fabsf(y[i] - idle_v) < STAGE_ACTIVE_MIN_V) continue;
-    if (fabsf(y[i] - (best.off_v + best.gain * x[i])) > 3.0f * sigma) continue;
-    if (x[i] < x0) below = std::max(below, x[i]);
-    else above = std::min(above, x[i]);
+    if (!(y[i] >= ADC_LINEAR_MIN_V && y[i] <= ADC_LINEAR_MAX_V)) continue;
+    if (x[i] <= best.lo_v || x[i] >= best.hi_v) continue;
+    const bool at_idle = fabsf(y[i] - idle_v) < STAGE_ACTIVE_MIN_V;
+    const float predicted = best.off_v + best.gain * x[i];
+    if (at_idle && fabsf(predicted - idle_v) > 2.0f * STAGE_ACTIVE_MIN_V) {
+      undriven++;
+      hole_lo = std::min(hole_lo, x[i]);
+      hole_hi = std::max(hole_hi, x[i]);
+    } else if (!at_idle && fabsf(y[i] - predicted) <= 3.0f * sigma) {
+      (x[i] < x0 ? below : above) = true;
+    }
   }
-  const float expected_gap = 2.0f * STAGE_ACTIVE_MIN_V / fabsf(best.gain) + HOLE_MIN_EXTRA_V;
-  if (isfinite(below) && isfinite(above) && above - below > expected_gap) {
-    best.hole_lo_v = below;
-    best.hole_hi_v = above;
+  if (undriven >= HOLE_MIN_SAMPLES) {
+    best.hole_lo_v = hole_lo;
+    best.hole_hi_v = hole_hi;
   }
+  // Around x0 a driven stage reads its idle level too, so readAutoPath can only
+  // trust idle-level readings if the stage is driven on both sides of x0 and
+  // x0 is not inside a hole.
+  const bool x0_in_hole = best.hole_lo_v < best.hole_hi_v && x0 > best.hole_lo_v && x0 < best.hole_hi_v;
+  best.center_ok = below && above && !x0_in_hole;
   return best;
 }
 
@@ -220,6 +248,7 @@ AcqResult acquire(const Settings& s, uint8_t trig_mode, bool (*abort_check)(), C
 
   // ---- Trigger --------------------------------------------------------------
   const uint8_t src = (s.trig_src < NUM_CHANNELS && use[s.trig_src]) ? s.trig_src : cap.ch[0];
+  cap.trig_src = src;
   const float level = s.trig_level;
   const float hyst = s.trig_hyst;
   const bool rising = s.trig_edge == EDGE_RISING;
@@ -228,22 +257,36 @@ AcqResult acquire(const Settings& s, uint8_t trig_mode, bool (*abort_check)(), C
   uint32_t pre = trig_mode == TRIG_FREE ? 0 : (uint64_t)n * s.pretrig_pct / 100;
   if (pre >= n) pre = n - 1;
 
-  // ---- Timing ---------------------------------------------------------------
-  const uint32_t cpu_hz = getCpuFrequencyMhz() * 1000000UL;
-  const uint32_t period = std::max<uint32_t>(1, cpu_hz / s.sample_rate);
-  const uint32_t frame_ms = (uint64_t)n * 1000 / s.sample_rate;
-  const uint32_t timeout_ms = (trig_mode == TRIG_AUTO ? 100 : 250) + 2 * frame_ms;
-  const uint32_t check_every = std::max<uint32_t>(1, s.sample_rate / 1000);  // ~1 ms
-
   const Recon r = makeRecon(s);
+  if (ext) g_ads.beginCapture();
+
+  // ---- Timing ---------------------------------------------------------------
+  // Time a few dry-run samples and never pace faster than the slowest one, so
+  // the sample spacing stays uniform even when the requested rate is more than
+  // the ADCs can deliver (the frame then reports the slower, real rate).
+  const uint32_t cpu_hz = getCpuFrequencyMhz() * 1000000UL;
+  uint32_t worst = 0;
+  for (int i = 0; i < 4; i++) {
+    Sample scratch = {};
+    const uint32_t t0 = ESP.getCycleCount();
+    if (ext) g_ads.convert();
+    readNative(use, r, scratch);
+    worst = std::max<uint32_t>(worst, ESP.getCycleCount() - t0);
+    if (ext) delayMicroseconds(2);  // ADS8681 t_CYC >= 1 us between conversions
+  }
+  const uint32_t period = std::max<uint32_t>(cpu_hz / s.sample_rate, worst + worst / 8 + 1);
+  const uint32_t rate = std::max<uint32_t>(1, cpu_hz / period);
+  const uint32_t frame_ms = (uint64_t)n * 1000 / rate;
+  const uint32_t timeout_ms = (trig_mode == TRIG_AUTO ? 100 : 250) + 2 * frame_ms;
+  const uint32_t check_every = std::max<uint32_t>(1, rate / 1000);  // ~1 ms
 
   // The ADS8681 returns each result one frame late (it converts on the CS
   // rising edge and shifts the data out in the next frame). Prime it with one
-  // conversion and delay the native readings by one tick to match, so every
-  // stored sample has all channels taken at the same instant.
+  // conversion and delay the native readings by one tick to match, so the
+  // DIRECT and EXT values of every stored sample are taken at the same instant.
+  // (V1 stage readings come one or two ADC reads later; see readAutoPath.)
   Sample prev = {};
   if (ext) {
-    g_ads.beginCapture();
     g_ads.convert();
     readNative(use, r, prev);
   }
@@ -350,7 +393,7 @@ AcqResult acquire(const Settings& s, uint8_t trig_mode, bool (*abort_check)(), C
   cap.n = n;
   cap.trig_index = (forced || trig_mode == TRIG_FREE) ? -1 : (int32_t)((trig_w + n - w) % n);
   int64_t elapsed_us = t_last - t_first;
-  cap.sample_rate = elapsed_us > 0 ? (filled - 1) * 1e6f / (float)elapsed_us : (float)s.sample_rate;
+  cap.sample_rate = elapsed_us > 0 ? (filled - 1) * 1e6f / (float)elapsed_us : (float)rate;
   return AcqResult::Ok;
 }
 
@@ -403,7 +446,8 @@ float scopeAutoReading(const Settings& s, uint8_t& band) {
   return readAutoPath(r, readDirect(r), band);
 }
 
-void scopeFitStages(const Settings& s, uint32_t count, uint32_t rate_hz, StageFit fit[NUM_STAGES]) {
+void scopeFitStages(const Settings& s, uint32_t count, uint32_t rate_hz, StageFit fit[NUM_STAGES],
+                    float& sweep_lo, float& sweep_hi) {
   count = std::min<uint32_t>(count, MAX_SAMPLES);
   const Recon r = makeRecon(s);
   // Reuse the capture buffers: x (input from the direct path) and each stage's
@@ -423,5 +467,7 @@ void scopeFitStages(const Settings& s, uint32_t count, uint32_t rate_hz, StageFi
     float x_after = readDirect(r);
     xs[i] = 0.5f * (x_before + x_after);
   }
+  sweep_lo = *std::min_element(xs, xs + count);
+  sweep_hi = *std::max_element(xs, xs + count);
   for (uint8_t b = 0; b < NUM_STAGES; b++) fit[b] = fitStage(xs, ys[b], count, s.stage_idle_v);
 }

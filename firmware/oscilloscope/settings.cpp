@@ -8,7 +8,7 @@
 
 namespace {
 
-constexpr uint32_t SETTINGS_MAGIC = 0x3343534F;  // "OSC3"
+constexpr uint32_t SETTINGS_MAGIC = 0x3443534F;  // "OSC4"
 constexpr char NVS_NAMESPACE[] = "scope";
 constexpr char NVS_KEY[] = "cfg";
 
@@ -44,6 +44,7 @@ void settingsDefaults(Settings& s) {
     s.window_hi_v[b] = DEFAULT_WINDOW_HI_V[b];
     s.hole_lo_v[b] = DEFAULT_HOLE_LO_V[b];
     s.hole_hi_v[b] = DEFAULT_HOLE_HI_V[b];
+    s.stage_center_ok[b] = 0;  // only CAL BANDS can establish this
   }
   s.stage_idle_v = DEFAULT_STAGE_IDLE_V;
 }
@@ -72,6 +73,7 @@ void settingsSanitize(Settings& s) {
     s.window_hi_v[b] = saneFinite(s.window_hi_v[b], d.window_hi_v[b]);
     s.hole_lo_v[b] = saneFinite(s.hole_lo_v[b], d.hole_lo_v[b]);
     s.hole_hi_v[b] = saneFinite(s.hole_hi_v[b], d.hole_hi_v[b]);
+    s.stage_center_ok[b] = s.stage_center_ok[b] ? 1 : 0;
   }
   s.stage_idle_v = saneFinite(s.stage_idle_v, d.stage_idle_v);
 }

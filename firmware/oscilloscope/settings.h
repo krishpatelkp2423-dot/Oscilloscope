@@ -43,7 +43,7 @@ struct Settings {
   float trig_hyst;       // volts
   uint8_t pretrig_pct;   // 0..100 % of the record before the trigger
   uint8_t ads_range;     // ADS8681 RANGE_SEL code
-  uint8_t reserved[2];
+  uint8_t stage_center_ok[2];  // CAL BANDS saw the stage driven around its idle point
 
   // Calibration. Input voltage reconstruction:
   //   DIRECT: V_in = (V_D2  - direct_mid_v) / direct_gain
@@ -61,6 +61,7 @@ struct Settings {
   float hole_hi_v[NUM_STAGES];    //   is never driven (lo >= hi: no hole)
   float stage_idle_v;             // stage output when its mux channel is off
 };
+static_assert(NUM_STAGES == 2, "stage_center_ok is sized for two stages");
 
 void settingsDefaults(Settings& s);
 void settingsSanitize(Settings& s);  // clamps everything into a valid range

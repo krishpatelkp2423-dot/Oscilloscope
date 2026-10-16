@@ -21,6 +21,12 @@
 #pragma once
 #include <Arduino.h>
 
+// Serial must be the native USB port: UART0's pins (D6/D7) carry the ADS8681's
+// RST_N and SDI on this board.
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && !ARDUINO_USB_CDC_ON_BOOT
+#error "Set Tools > USB CDC On Boot to Enabled (UART0 shares D6/D7 with the ADS8681)"
+#endif
+
 // ---------------------------------------------------------------------------
 //  XIAO pins (Dx labels work on the XIAO ESP32C3, ESP32S3 and ESP32C6)
 // ---------------------------------------------------------------------------
@@ -52,8 +58,9 @@ constexpr uint8_t DEFAULT_ADS_RANGE = 0x4;
 
 // Gain stages: inverting amplifiers biased at the R24/R27 mid-rail, so
 //   V_adc = off + g * V_in   with g < 0.
-// Gains are the design values (3.3 V / window width: x5.5 for window 1,
-// x2.36 for window 2; R7 = 255k feedback on stage 1).
+// Design gains: x2.36 for window 2 (3.3 V / 1.4 V window), and x5.5 for
+// window 1, which maps its +/-0.275 V onto about 0.14..3.16 V, leaving headroom
+// below the 3.3 V rail (R7 = 255k is stage 1's feedback resistor).
 constexpr float DEFAULT_STAGE_GAIN[2] = {-5.5f, -2.36f};
 constexpr float DEFAULT_STAGE_OFF_V[2] = {1.65f, 1.65f};
 // Output of a stage whose mux channel is off (no current in its input
@@ -66,10 +73,10 @@ constexpr float DEFAULT_STAGE_IDLE_V = 1.65f;
 // 0.95 .. 2.35 V = +/-0.70 V. CAL BANDS replaces both with measured edges.
 constexpr float DEFAULT_WINDOW_LO_V[2] = {-0.275f, -0.70f};
 constexpr float DEFAULT_WINDOW_HI_V[2] = {0.275f, 0.70f};
-// The windows are nested and the mux picks the innermost one, so stage 2 is
-// never driven inside window 1: that region is its "hole". An undriven stage
-// sits at its idle level, which reads as roughly 0 V, so without the hole an
-// idle stage 2 would look valid for small inputs.
+// The windows are nested, so the mux never drives stage 2 inside window 1:
+// that region is its "hole". (As drawn, inside window 1 the mux selects the
+// unconnected Y3, so neither stage is driven there; see README.) An undriven
+// stage sits at its idle level, which reads as roughly 0 V.
 constexpr float DEFAULT_HOLE_LO_V[2] = {0.0f, -0.275f};
 constexpr float DEFAULT_HOLE_HI_V[2] = {0.0f, 0.275f};
 
@@ -80,8 +87,8 @@ constexpr float AUTO_WINDOW_MARGIN_V = 0.05f;
 constexpr float AUTO_MATCH_TOL_V = 0.04f;
 // CAL BANDS: a stage counts as driven when it is this far from its idle level,
 constexpr float STAGE_ACTIVE_MIN_V = 0.10f;
-// and a gap in its driven inputs wider than expected by this much is a hole.
-constexpr float HOLE_MIN_EXTRA_V = 0.10f;
+// and this many samples at idle where the fit says it should be driven make a hole.
+constexpr uint32_t HOLE_MIN_SAMPLES = 5;
 
 // Native ESP32 ADC: widest attenuation, and the span where its readings are
 // trustworthy (Espressif: about 0..2.5 V on the C3, 0..3.1 V on the S3).
