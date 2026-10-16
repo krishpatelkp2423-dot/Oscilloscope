@@ -361,7 +361,7 @@ f_\text{alias} = \lvert f - \ell f_s \rvert, \qquad \ell = \operatorname{round}(
 
 $`f`$ is the input frequency and $`\ell f_s`$ the multiple of $`f_s`$ nearest to it. At the default 10 kS/s, $`f_s/2 = 5\,\text{kHz}`$, and a 12 kHz input shows up as 2 kHz. The trigger and the frequency readout treat an alias as a real signal.
 
-The native paths alias almost everything. Between the probe and pins D0–D2 there are only op-amps and the mux, with no RC filter, so tones and noise up to several MHz fold into the trace. An analog low-pass in front of the ESP32 pins would fix this (see the [Roadmap](#roadmap)).
+The native paths alias almost everything. Between the probe and pins D0–D2 there are only op-amps and the mux, with no RC filter, so tones and noise up to several MHz fold into the trace. An analog low-pass in front of the ESP32 pins would help (see the [Roadmap](#roadmap)). A single RC mainly cuts the aliased noise; stopping tones from aliasing takes a steeper filter, about 4th order.
 
 The ADS8681's filter is 26 dB down at 100 kHz, so far less wideband noise reaches V3. V3 still aliases at 10 kS/s, though: the filter's corner is above 5 kHz, so a 12 kHz tone arrives at 79% amplitude and appears at 2 kHz.
 
@@ -448,7 +448,7 @@ The mux channel is a 2-bit number. Each window flag ($`W_1`$, $`W_2`$) is 1 when
 
 The windows are nested (±0.275 V inside ±0.70 V), so $`W_1`$ implies $`W_2`$. Inside window 1 both flags are 1, which selects the unconnected Y3. Channel 1 (stage 1) needs $`W_1 \land \lnot W_2`$, which never happens, so **as drawn, gain stage 1 can never be selected**. Either fix works: drive $`S_B`$ from $`W_2 \land \lnot W_1`$ (one XOR gate, since it equals $`W_1 \oplus W_2`$), or move stage 1 from Y1 to Y3.
 
-The firmware cannot see the select lines, so it checks each stage against the direct path, highest gain first. Stage $`b`$'s reading $`y_b`$ is accepted only if it is inside the ADC's linear range and away from the stage's idle level (about 1.65 V, its output when its mux channel is off). It must also match the direct reading $`x_k`$, interpolated to the moment the stage was read: $`\lvert (y_b - \text{off}_b)/g_b - x_k \rvert \le 0.04\,\text{V}`$. Otherwise the direct reading is used. For a 1 kHz sine of 0.5 V amplitude at 15 µs per read, skipping the interpolation would leave a 47–94 mV mismatch; interpolating cuts it to 4.4 mV.
+The firmware cannot see the select lines, so it checks each stage against the direct path, highest gain first. Stage $`b`$'s reading $`y_b`$ is accepted only if it is inside the ADC's linear range and away from the stage's idle level (about 1.65 V, its output when its mux channel is off). The idle check is dropped once `CAL BANDS` has seen the stage driven on both sides of that level. It must also match the direct reading $`x_k`$, interpolated to the moment the stage was read: $`\lvert (y_b - \text{off}_b)/g_b - x_k \rvert \le 0.04\,\text{V}`$. Otherwise the direct reading is used. For a 1 kHz sine of 0.5 V amplitude at 15 µs per read, skipping the interpolation would leave a 47–94 mV mismatch; interpolating cuts it to 4.4 mV.
 
 ### Calibration, triggering and measurements
 
@@ -466,7 +466,7 @@ The trigger uses hysteresis so that noise cannot fire it. For a rising edge at l
 
 The host's readouts are simple statistics: mean $`\bar y`$, $`\text{RMS} = \sqrt{\tfrac{1}{n}\sum y_i^2}`$, AC RMS $`= \sqrt{\text{RMS}^2 - \bar y^2}`$ and peak-to-peak. A sine of 0.5 V amplitude on 0.2 V DC reads 0.406 V RMS, 0.354 V of it AC.
 
-Frequency comes from interpolated crossings of the mid-level $`v_\text{mid} = (\max + \min)/2`$, with 10% of peak-to-peak as hysteresis. A crossing between samples $`i`$ and $`i+1`$ lands at sample position
+Frequency comes from interpolated rising crossings of the mid-level $`v_\text{mid} = (\max + \min)/2`$, with 10% of peak-to-peak as hysteresis. A crossing between samples $`i`$ and $`i+1`$ lands at sample position
 
 ```math
 t_c = i + \frac{v_\text{mid} - y_i}{y_{i+1} - y_i}
