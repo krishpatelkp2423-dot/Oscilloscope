@@ -2,10 +2,12 @@
 //  DIY Oscilloscope firmware — Seeed Studio XIAO ESP32 (C3 / S3 / C6)
 //
 //  Three acquisition paths share one level-shifting front end:
-//    V1 AUTO   — window comparators + CD4052 pick a gain band in hardware;
-//                firmware reads the band and divides the gain back out.
-//    V2 DIRECT — level-shifted signal straight into the ESP32 ADC.
-//    V3 EXT    — ADS8681 16-bit SAR ADC over SPI (driver in ads8681.cpp).
+//    V1 AUTO   — window comparators + CD4052 steer the signal into one of two
+//                inverting gain stages (D0, D1); firmware picks the live stage
+//                and divides its gain back out.
+//    V2 DIRECT — level-shifted signal straight into the ESP32 ADC (D2).
+//    V3 EXT    — ADS8681 16-bit SAR ADC on the raw input, over SPI
+//                (driver in ads8681.cpp).
 //
 //  Data and control go over the USB serial port. Send HELP for the command
 //  list. FORMAT CSV (the default) prints Arduino Serial Plotter-friendly text;
@@ -23,7 +25,7 @@
 #include "scope.h"
 #include "settings.h"
 
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.1.0"
 
 namespace {
 
@@ -118,15 +120,18 @@ void printHelp() {
   reply("  TRIG FREE|AUTO|NORMAL       trigger mode");
   reply("  EDGE RISING|FALLING         trigger edge");
   reply("  LEVEL <V> | HYST <V>        trigger level / hysteresis, input-referred volts");
-  reply("  SRC AUTO|DIRECT|EXT|HW      trigger source (HW = LPV7215 comparator pin)");
+  reply("  SRC AUTO|DIRECT|EXT         trigger source");
   reply("  PRE <0-100>                 pre-trigger percentage of the record");
   reply("  FORMAT CSV|BIN              text for Serial Plotter / binary for scope_gui.py");
-  reply("  ADSRANGE <code>             ADS8681 range: 0-4 bipolar, 8-11 unipolar (0xB=0..5.12V)");
-  reply("  GAIN <code 0-3> <gain>      auto-range gain for a CD4052 select code");
-  reply("  PGAIN AUTO|DIRECT|EXT <g>   path gain, input -> ADC node");
-  reply("  MID AUTO|DIRECT|EXT <V>     ADC-node voltage that means 0 V at the input");
-  reply("  CAL ZERO                    input shorted to GND: measure every mid-point");
-  reply("  CAL GAIN <V>                known DC input applied: measure path/band gains");
+  reply("  ADSRANGE <code>             ADS8681 range: 0-4 bipolar (0x4=+/-2.56V), 8-11 unipolar");
+  reply("  MID DIRECT|EXT <V>          node voltage that means 0 V at the input");
+  reply("  PGAIN DIRECT|EXT <g>        path gain, input -> ADC node");
+  reply("  STAGE <1|2> <gain> [off V]  gain stage: V_adc = off + gain * V_in (gain < 0)");
+  reply("  WINDOW <1|2> <lo> <hi> [<hole lo> <hole hi>] | OFF");
+  reply("                              input range where a gain stage may be used");
+  reply("  CAL ZERO                    input shorted to GND: measure mid-points");
+  reply("  CAL GAIN <V>                known DC input: measure DIRECT/EXT gains");
+  reply("  CAL BANDS                   slow signal swept over +/-1 V: fit both gain stages");
   reply("  PROBE                       raw reading of every net (board bring-up)");
   reply("  INFO | SAVE | LOAD | DEFAULTS");
 }
@@ -147,42 +152,56 @@ void printInfo() {
         scopeChannelAvailable(CH_DIRECT) ? "yes" : "no",
         scopeChannelAvailable(CH_EXT) ? "yes" : "no",
         scopeAdsPresent() ? "detected" : "NOT detected", range);
-  reply("cal mid: auto=%.4f direct=%.4f ext=%.4f V", g_cfg.mid_v[CH_AUTO],
-        g_cfg.mid_v[CH_DIRECT], g_cfg.mid_v[CH_EXT]);
-  reply("cal path gain: auto=%.4f direct=%.4f ext=%.4f", g_cfg.path_gain[CH_AUTO],
-        g_cfg.path_gain[CH_DIRECT], g_cfg.path_gain[CH_EXT]);
-  reply("cal band gain: 0=%.4f 1=%.4f 2=%.4f 3=%.4f", g_cfg.band_gain[0], g_cfg.band_gain[1],
-        g_cfg.band_gain[2], g_cfg.band_gain[3]);
-  reply("pins: direct=%d auto=%d bandA=%d bandB=%d hwtrig=%d ads cs=%d rst=%d sck=%d miso=%d "
-        "mosi=%d (GPIO numbers)",
-        PIN_ADC_DIRECT, PIN_ADC_AUTO, PIN_BAND_A, PIN_BAND_B, PIN_HW_TRIGGER, PIN_ADS_CS,
-        PIN_ADS_RST, PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+  reply("cal direct: mid=%.4f V gain=%.4f | ext: mid=%.5f V gain=%.4f", g_cfg.direct_mid_v,
+        g_cfg.direct_gain, g_cfg.ext_mid_v, g_cfg.ext_gain);
+  for (uint8_t b = 0; b < NUM_STAGES; b++) {
+    if (g_cfg.window_lo_v[b] < g_cfg.window_hi_v[b]) {
+      char hole[40] = "";
+      if (g_cfg.hole_lo_v[b] < g_cfg.hole_hi_v[b]) {
+        snprintf(hole, sizeof hole, " except %+.3f..%+.3f V", g_cfg.hole_lo_v[b],
+                 g_cfg.hole_hi_v[b]);
+      }
+      reply("cal stage %u: gain=%.4f off=%.4f V window %+.3f..%+.3f V%s", b + 1,
+            g_cfg.stage_gain[b], g_cfg.stage_off_v[b], g_cfg.window_lo_v[b],
+            g_cfg.window_hi_v[b], hole);
+    } else {
+      reply("cal stage %u: gain=%.4f off=%.4f V window OFF", b + 1, g_cfg.stage_gain[b],
+            g_cfg.stage_off_v[b]);
+    }
+  }
+  reply("cal stage idle level=%.4f V", g_cfg.stage_idle_v);
+  reply("pins (GPIO): direct=%d stage1=%d stage2=%d ads cs=%d rst=%d sck=%d miso=%d mosi=%d",
+        PIN_ADC_DIRECT, PIN_ADC_STAGE1, PIN_ADC_STAGE2, PIN_ADS_CS, PIN_ADS_RST, PIN_SPI_SCK,
+        PIN_SPI_MISO, PIN_SPI_MOSI);
 }
 
-// Live raw readings of every net, to check the pin map against the board:
-// with the input grounded each ADC node should read about 1.65 V.
+// Live raw readings of every net, to check the board against the schematic:
+// with the input grounded, D2 and both stage outputs should read about 1.65 V
+// and the ADS8681 about 0 V.
 void probe() {
   if (!scopeAdsPresent()) scopeAdsRedetect(g_cfg.ads_range);
   RawReading rd;
-  if (scopeMeasureRaw(CH_DIRECT, 256, rd)) {
-    reply("PROBE direct: node=%.4f V (min %.4f max %.4f) -> input %+.4f V", rd.mean_v, rd.min_v,
-          rd.max_v, (rd.mean_v - g_cfg.mid_v[CH_DIRECT]) / g_cfg.path_gain[CH_DIRECT]);
+  if (scopeMeasureRaw(RAW_DIRECT, 256, rd)) {
+    reply("PROBE direct (D2): node=%.4f V (min %.4f max %.4f) -> input %+.4f V", rd.mean_v,
+          rd.min_v, rd.max_v, (rd.mean_v - g_cfg.direct_mid_v) / g_cfg.direct_gain);
   }
-  if (scopeMeasureRaw(CH_AUTO, 256, rd)) {
-    float gain = g_cfg.path_gain[CH_AUTO] * g_cfg.band_gain[rd.band];
-    reply("PROBE auto: node=%.4f V (min %.4f max %.4f) band=%u%s gain=%.3f -> input %+.4f V",
-          rd.mean_v, rd.min_v, rd.max_v, rd.band, rd.band_stable ? "" : " (changing)", gain,
-          (rd.mean_v - g_cfg.mid_v[CH_AUTO]) / gain);
+  for (uint8_t b = 0; b < NUM_STAGES; b++) {
+    if (!scopeMeasureRaw(RAW_STAGE1 + b, 256, rd)) continue;
+    reply("PROBE stage %u (D%u): node=%.4f V (min %.4f max %.4f) -> input %+.4f V if driven",
+          b + 1, b, rd.mean_v, rd.min_v, rd.max_v,
+          (rd.mean_v - g_cfg.stage_off_v[b]) / g_cfg.stage_gain[b]);
   }
-  if (scopeMeasureRaw(CH_EXT, 256, rd)) {
-    reply("PROBE ext: code=0x%04X node=%.5f V (min %.5f max %.5f) -> input %+.5f V", rd.last_code,
-          rd.mean_v, rd.min_v, rd.max_v,
-          (rd.mean_v - g_cfg.mid_v[CH_EXT]) / g_cfg.path_gain[CH_EXT]);
+  uint8_t band;
+  float v = scopeAutoReading(g_cfg, band);
+  reply("PROBE auto: input %+.4f V from %s", v,
+        band == 0 ? "the direct path (no gain stage agreed)" : band == 1 ? "stage 1" : "stage 2");
+  if (scopeMeasureRaw(RAW_EXT, 256, rd)) {
+    reply("PROBE ext: code=0x%04X node=%+.5f V (min %+.5f max %+.5f) -> input %+.5f V",
+          rd.last_code, rd.mean_v, rd.min_v, rd.max_v,
+          (rd.mean_v - g_cfg.ext_mid_v) / g_cfg.ext_gain);
   } else {
-    reply("PROBE ext: ADS8681 not detected (check CS/SCK/MISO/MOSI, 5 V AVDD, 3.3 V DVDD)");
+    reply("PROBE ext: ADS8681 not detected (check CS/SCLK/SDI/SDO, 5 V AVDD, 3.3 V DVDD)");
   }
-  reply("PROBE pins: bandA=%d bandB=%d hwtrig=%d", (scopeReadBand() & 1) ? 1 : 0,
-        (scopeReadBand() & 2) ? 1 : 0, scopeReadHwTrigger() ? 1 : 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,14 +209,30 @@ void probe() {
 // ---------------------------------------------------------------------------
 
 void calZero() {
+  RawReading rd;
   bool any = false;
-  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
-    RawReading rd;
-    if (!scopeMeasureRaw(ch, 2048, rd)) continue;
-    g_cfg.mid_v[ch] = rd.mean_v;
+  if (scopeMeasureRaw(RAW_DIRECT, 2048, rd)) {
+    g_cfg.direct_mid_v = rd.mean_v;
     any = true;
-    reply("CAL ZERO %s: mid=%.5f V (noise p-p %.2f mV)", channelName(ch), rd.mean_v,
+    reply("CAL ZERO direct: mid=%.5f V (noise p-p %.2f mV)", rd.mean_v,
           (rd.max_v - rd.min_v) * 1000.0f);
+  }
+  if (scopeMeasureRaw(RAW_EXT, 2048, rd)) {
+    g_cfg.ext_mid_v = rd.mean_v;
+    any = true;
+    reply("CAL ZERO ext: mid=%+.5f V (noise p-p %.3f mV)", rd.mean_v,
+          (rd.max_v - rd.min_v) * 1000.0f);
+  }
+  // 0 V sits inside window 1, so stage 2's mux channel is off: its output is
+  // the idle level that CAL BANDS uses to tell driven from undriven samples.
+  if (scopeMeasureRaw(RAW_STAGE2, 2048, rd)) {
+    g_cfg.stage_idle_v = rd.mean_v;
+    any = true;
+    reply("CAL ZERO stage idle (D1): %.5f V", rd.mean_v);
+  }
+  if (scopeMeasureRaw(RAW_STAGE1, 2048, rd)) {
+    reply("CAL ZERO stage 1 (D0) at 0 V: %.5f V (equals the idle level if stage 1 is driven "
+          "there and its offset is small)", rd.mean_v);
   }
   reply(any ? "OK CAL ZERO done; SAVE to keep it" : "ERR no channels to calibrate");
 }
@@ -207,28 +242,56 @@ void calGain(float known_v) {
     reply("ERR apply and pass a known DC voltage of at least 50 mV, e.g. CAL GAIN 1.000");
     return;
   }
-  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
+  struct Path {
+    uint8_t src;
+    const char* name;
+    float mid;
+    float* gain;
+  } paths[] = {
+      {RAW_DIRECT, "DIRECT", g_cfg.direct_mid_v, &g_cfg.direct_gain},
+      {RAW_EXT, "EXT", g_cfg.ext_mid_v, &g_cfg.ext_gain},
+  };
+  for (const Path& p : paths) {
     RawReading rd;
-    if (!scopeMeasureRaw(ch, 2048, rd)) continue;
-    float delta = rd.mean_v - g_cfg.mid_v[ch];
+    if (!scopeMeasureRaw(p.src, 2048, rd)) continue;
+    float delta = rd.mean_v - p.mid;
     if (fabsf(delta) < 0.01f) {
-      reply("CAL GAIN %s: skipped, node moved only %.1f mV from mid", channelName(ch),
-            delta * 1000.0f);
+      reply("CAL GAIN %s: skipped, node moved only %.1f mV from mid", p.name, delta * 1000.0f);
       continue;
     }
-    if (ch == CH_AUTO) {
-      if (!rd.band_stable) {
-        reply("CAL GAIN AUTO: skipped, band changed during the measurement");
-        continue;
-      }
-      g_cfg.band_gain[rd.band] = delta / (known_v * g_cfg.path_gain[CH_AUTO]);
-      reply("CAL GAIN AUTO: band %u gain=%.4f", rd.band, g_cfg.band_gain[rd.band]);
-    } else {
-      g_cfg.path_gain[ch] = delta / known_v;
-      reply("CAL GAIN %s: path gain=%.4f", channelName(ch), g_cfg.path_gain[ch]);
+    *p.gain = delta / known_v;
+    reply("CAL GAIN %s: path gain=%.5f", p.name, *p.gain);
+  }
+  reply("OK CAL GAIN done; run CAL BANDS next for the auto-range stages, then SAVE");
+}
+
+void calBands() {
+  reply("CAL BANDS: sampling for 2 s; keep a slow signal (<= 50 Hz) sweeping across +/-1 V");
+  StageFit fit[NUM_STAGES];
+  scopeFitStages(g_cfg, 4000, 2000, fit);
+  for (uint8_t b = 0; b < NUM_STAGES; b++) {
+    const StageFit& f = fit[b];
+    if (!f.ok) {
+      g_cfg.window_lo_v[b] = g_cfg.window_hi_v[b] = 0.0f;
+      reply("CAL BANDS stage %u: only %lu driven samples; stage disabled. Is its CD4052 channel "
+            "ever selected? (see README: nested windows select Y3)", b + 1, (unsigned long)f.n);
+      continue;
+    }
+    g_cfg.stage_gain[b] = f.gain;
+    g_cfg.stage_off_v[b] = f.off_v;
+    g_cfg.window_lo_v[b] = f.lo_v;
+    g_cfg.window_hi_v[b] = f.hi_v;
+    g_cfg.hole_lo_v[b] = f.hole_lo_v;
+    g_cfg.hole_hi_v[b] = f.hole_hi_v;
+    reply("CAL BANDS stage %u: gain=%.4f off=%.4f V window %+.3f..%+.3f V, fit residual "
+          "%.2f mV rms over %lu samples", b + 1, f.gain, f.off_v, f.lo_v, f.hi_v,
+          f.resid_v * 1000.0f, (unsigned long)f.n);
+    if (f.hole_lo_v < f.hole_hi_v) {
+      reply("CAL BANDS stage %u: not driven for %+.3f..%+.3f V (inner window)", b + 1,
+            f.hole_lo_v, f.hole_hi_v);
     }
   }
-  reply("OK CAL GAIN done; SAVE to keep it");
+  reply("OK CAL BANDS done; SAVE to keep it");
 }
 
 // ---------------------------------------------------------------------------
@@ -260,17 +323,21 @@ int lookup(const char* tok, const char* const* names, int count) {
 const char* const kModeNames[] = {"AUTO", "DIRECT", "EXT", "ALL"};
 const char* const kTrigNames[] = {"FREE", "AUTO", "NORMAL"};
 const char* const kEdgeNames[] = {"RISING", "FALLING"};
-const char* const kSrcNames[] = {"AUTO", "DIRECT", "EXT", "HW"};
+const char* const kSrcNames[] = {"AUTO", "DIRECT", "EXT"};
+const char* const kCalPathNames[] = {"DIRECT", "EXT"};
 
 void handleCommand(char* line) {
   char* cmd = strtok(line, " \t");
   if (!cmd) return;
   char* a1 = strtok(nullptr, " \t");
   char* a2 = strtok(nullptr, " \t");
+  char* a3 = strtok(nullptr, " \t");
+  char* a4 = strtok(nullptr, " \t");
+  char* a5 = strtok(nullptr, " \t");
   for (char* p = cmd; *p; p++) *p = toupper(*p);
 
   uint32_t u;
-  float f;
+  float f, f2, f3, f4;
   int idx;
 
   if (!strcmp(cmd, "HELP") || !strcmp(cmd, "?")) {
@@ -323,7 +390,7 @@ void handleCommand(char* line) {
     g_cfg.trig_hyst = f;
     reply("OK HYST %.4f", f);
   } else if (!strcmp(cmd, "SRC")) {
-    if ((idx = lookup(a1, kSrcNames, 4)) < 0) return reply("ERR SRC AUTO|DIRECT|EXT|HW");
+    if ((idx = lookup(a1, kSrcNames, NUM_CHANNELS)) < 0) return reply("ERR SRC AUTO|DIRECT|EXT");
     g_cfg.trig_src = idx;
     reply("OK SRC %s", channelName(idx));
   } else if (!strcmp(cmd, "PRE")) {
@@ -346,31 +413,51 @@ void handleCommand(char* line) {
     char range[24];
     ADS8681::describeRange(u, range, sizeof range);
     reply("OK ADSRANGE 0x%lX (%s)", (unsigned long)u, range);
-  } else if (!strcmp(cmd, "GAIN")) {
-    if (!parseUint(a1, u) || u > 3 || !parseFloat(a2, f) || f == 0.0f) {
-      return reply("ERR GAIN <code 0-3> <gain>");
+  } else if (!strcmp(cmd, "MID") || !strcmp(cmd, "PGAIN")) {
+    bool mid = !strcmp(cmd, "MID");
+    if ((idx = lookup(a1, kCalPathNames, 2)) < 0 || !parseFloat(a2, f) || (!mid && f == 0.0f)) {
+      return reply("ERR %s DIRECT|EXT <%s>", cmd, mid ? "volts" : "gain");
     }
-    g_cfg.band_gain[u] = f;
-    reply("OK GAIN %lu %.4f", (unsigned long)u, f);
-  } else if (!strcmp(cmd, "PGAIN")) {
-    if ((idx = lookup(a1, kSrcNames, NUM_CHANNELS)) < 0 || !parseFloat(a2, f) || f == 0.0f) {
-      return reply("ERR PGAIN AUTO|DIRECT|EXT <gain>");
+    float* target = mid ? (idx == 0 ? &g_cfg.direct_mid_v : &g_cfg.ext_mid_v)
+                        : (idx == 0 ? &g_cfg.direct_gain : &g_cfg.ext_gain);
+    *target = f;
+    reply("OK %s %s %.5f", cmd, kCalPathNames[idx], f);
+  } else if (!strcmp(cmd, "STAGE")) {
+    if (!parseUint(a1, u) || u < 1 || u > NUM_STAGES || !parseFloat(a2, f) || f == 0.0f ||
+        (a3 && !parseFloat(a3, f2))) {
+      return reply("ERR STAGE <1|2> <gain> [offset volts]");
     }
-    g_cfg.path_gain[idx] = f;
-    reply("OK PGAIN %s %.4f", channelName(idx), f);
-  } else if (!strcmp(cmd, "MID")) {
-    if ((idx = lookup(a1, kSrcNames, NUM_CHANNELS)) < 0 || !parseFloat(a2, f)) {
-      return reply("ERR MID AUTO|DIRECT|EXT <volts>");
+    g_cfg.stage_gain[u - 1] = f;
+    if (a3) g_cfg.stage_off_v[u - 1] = f2;
+    reply("OK STAGE %lu gain=%.4f off=%.4f", (unsigned long)u, g_cfg.stage_gain[u - 1],
+          g_cfg.stage_off_v[u - 1]);
+  } else if (!strcmp(cmd, "WINDOW")) {
+    if (!parseUint(a1, u) || u < 1 || u > NUM_STAGES) {
+      return reply("ERR WINDOW <1|2> <lo> <hi> [<hole lo> <hole hi>] | WINDOW <1|2> OFF");
     }
-    g_cfg.mid_v[idx] = f;
-    reply("OK MID %s %.4f", channelName(idx), f);
+    if (a2 && !strcasecmp(a2, "OFF")) {
+      g_cfg.window_lo_v[u - 1] = g_cfg.window_hi_v[u - 1] = 0.0f;
+      return reply("OK WINDOW %lu OFF", (unsigned long)u);
+    }
+    if (!parseFloat(a2, f) || !parseFloat(a3, f2) || f >= f2 ||
+        (a4 && (!parseFloat(a4, f3) || !parseFloat(a5, f4) || f3 >= f4))) {
+      return reply("ERR WINDOW <1|2> <lo> <hi> [<hole lo> <hole hi>] with lo < hi");
+    }
+    g_cfg.window_lo_v[u - 1] = f;
+    g_cfg.window_hi_v[u - 1] = f2;
+    g_cfg.hole_lo_v[u - 1] = a4 ? f3 : 0.0f;
+    g_cfg.hole_hi_v[u - 1] = a4 ? f4 : 0.0f;
+    reply("OK WINDOW %lu %+.3f..%+.3f hole %+.3f..%+.3f", (unsigned long)u, f, f2,
+          g_cfg.hole_lo_v[u - 1], g_cfg.hole_hi_v[u - 1]);
   } else if (!strcmp(cmd, "CAL")) {
     if (a1 && !strcasecmp(a1, "ZERO")) {
       calZero();
     } else if (a1 && !strcasecmp(a1, "GAIN") && parseFloat(a2, f)) {
       calGain(f);
+    } else if (a1 && !strcasecmp(a1, "BANDS")) {
+      calBands();
     } else {
-      reply("ERR CAL ZERO | CAL GAIN <volts>");
+      reply("ERR CAL ZERO | CAL GAIN <volts> | CAL BANDS");
     }
   } else if (!strcmp(cmd, "PROBE")) {
     probe();

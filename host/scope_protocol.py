@@ -33,7 +33,7 @@ MAX_PAYLOAD = 1 << 20
 
 MODES = ["AUTO", "DIRECT", "EXT", "ALL"]
 CHANNELS = ["AUTO", "DIRECT", "EXT"]  # index = channel id
-TRIGGER_SOURCES = ["AUTO", "DIRECT", "EXT", "HW"]
+TRIGGER_SOURCES = ["AUTO", "DIRECT", "EXT"]
 
 # Espressif's native-USB VID (XIAO ESP32C3/S3/C6), then common USB-UART bridges.
 KNOWN_VIDS = (0x303A, 0x10C4, 0x1A86)
@@ -49,7 +49,7 @@ class Waveform:
     sample_rate: float
     trig_level: float
     channels: dict[str, np.ndarray]  # name -> input-referred volts
-    bands: np.ndarray | None  # CD4052 select code per sample (AUTO path)
+    bands: np.ndarray | None  # AUTO path source per sample: 0 direct, 1 stage 1, 2 stage 2
 
     @property
     def n(self) -> int:

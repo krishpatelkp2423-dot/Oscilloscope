@@ -8,13 +8,15 @@
 
 namespace {
 
-constexpr uint32_t SETTINGS_MAGIC = 0x3143534F;  // "OSC1"
+constexpr uint32_t SETTINGS_MAGIC = 0x3343534F;  // "OSC3"
 constexpr char NVS_NAMESPACE[] = "scope";
 constexpr char NVS_KEY[] = "cfg";
 
-float sanePositive(float v, float fallback) {
+float saneGain(float v, float fallback) {
   return (isfinite(v) && fabsf(v) > 1e-6f) ? v : fallback;
 }
+
+float saneFinite(float v, float fallback) { return isfinite(v) ? v : fallback; }
 
 }  // namespace
 
@@ -31,11 +33,19 @@ void settingsDefaults(Settings& s) {
   s.trig_hyst = 0.03f;
   s.pretrig_pct = 25;
   s.ads_range = DEFAULT_ADS_RANGE;
-  for (int ch = 0; ch < NUM_CHANNELS; ch++) {
-    s.mid_v[ch] = DEFAULT_MID_V;
-    s.path_gain[ch] = DEFAULT_FRONTEND_GAIN;
+  s.direct_mid_v = DEFAULT_DIRECT_MID_V;
+  s.direct_gain = DEFAULT_DIRECT_GAIN;
+  s.ext_mid_v = DEFAULT_EXT_MID_V;
+  s.ext_gain = DEFAULT_EXT_GAIN;
+  for (int b = 0; b < NUM_STAGES; b++) {
+    s.stage_gain[b] = DEFAULT_STAGE_GAIN[b];
+    s.stage_off_v[b] = DEFAULT_STAGE_OFF_V[b];
+    s.window_lo_v[b] = DEFAULT_WINDOW_LO_V[b];
+    s.window_hi_v[b] = DEFAULT_WINDOW_HI_V[b];
+    s.hole_lo_v[b] = DEFAULT_HOLE_LO_V[b];
+    s.hole_hi_v[b] = DEFAULT_HOLE_HI_V[b];
   }
-  for (int b = 0; b < 4; b++) s.band_gain[b] = DEFAULT_BAND_GAIN[b];
+  s.stage_idle_v = DEFAULT_STAGE_IDLE_V;
 }
 
 void settingsSanitize(Settings& s) {
@@ -44,18 +54,26 @@ void settingsSanitize(Settings& s) {
   if (s.mode >= MODE_COUNT) s.mode = d.mode;
   if (s.trig_mode > TRIG_NORMAL) s.trig_mode = d.trig_mode;
   if (s.trig_edge > EDGE_FALLING) s.trig_edge = d.trig_edge;
-  if (s.trig_src > TRIG_SRC_HW) s.trig_src = d.trig_src;
+  if (s.trig_src >= NUM_CHANNELS) s.trig_src = d.trig_src;
   s.sample_rate = constrain(s.sample_rate, MIN_SAMPLE_RATE, MAX_SAMPLE_RATE);
   s.nsamples = constrain(s.nsamples, MIN_SAMPLES, MAX_SAMPLES);
-  if (!isfinite(s.trig_level)) s.trig_level = d.trig_level;
+  s.trig_level = saneFinite(s.trig_level, d.trig_level);
   if (!isfinite(s.trig_hyst) || s.trig_hyst < 0.0f) s.trig_hyst = d.trig_hyst;
   if (s.pretrig_pct > 100) s.pretrig_pct = 100;
   if (!ADS8681::isValidRange(s.ads_range)) s.ads_range = d.ads_range;
-  for (int ch = 0; ch < NUM_CHANNELS; ch++) {
-    if (!isfinite(s.mid_v[ch])) s.mid_v[ch] = d.mid_v[ch];
-    s.path_gain[ch] = sanePositive(s.path_gain[ch], d.path_gain[ch]);
+  s.direct_mid_v = saneFinite(s.direct_mid_v, d.direct_mid_v);
+  s.direct_gain = saneGain(s.direct_gain, d.direct_gain);
+  s.ext_mid_v = saneFinite(s.ext_mid_v, d.ext_mid_v);
+  s.ext_gain = saneGain(s.ext_gain, d.ext_gain);
+  for (int b = 0; b < NUM_STAGES; b++) {
+    s.stage_gain[b] = saneGain(s.stage_gain[b], d.stage_gain[b]);
+    s.stage_off_v[b] = saneFinite(s.stage_off_v[b], d.stage_off_v[b]);
+    s.window_lo_v[b] = saneFinite(s.window_lo_v[b], d.window_lo_v[b]);
+    s.window_hi_v[b] = saneFinite(s.window_hi_v[b], d.window_hi_v[b]);
+    s.hole_lo_v[b] = saneFinite(s.hole_lo_v[b], d.hole_lo_v[b]);
+    s.hole_hi_v[b] = saneFinite(s.hole_hi_v[b], d.hole_hi_v[b]);
   }
-  for (int b = 0; b < 4; b++) s.band_gain[b] = sanePositive(s.band_gain[b], d.band_gain[b]);
+  s.stage_idle_v = saneFinite(s.stage_idle_v, d.stage_idle_v);
 }
 
 bool settingsLoad(Settings& s) {
@@ -94,8 +112,8 @@ const char* modeName(uint8_t mode) {
 }
 
 const char* channelName(uint8_t ch) {
-  static const char* const names[] = {"AUTO", "DIRECT", "EXT", "HW"};
-  return ch <= TRIG_SRC_HW ? names[ch] : "?";
+  static const char* const names[] = {"AUTO", "DIRECT", "EXT"};
+  return ch < NUM_CHANNELS ? names[ch] : "?";
 }
 
 const char* trigModeName(uint8_t mode) {
