@@ -13,6 +13,7 @@ struct Capture {
   uint8_t ch[NUM_CHANNELS] = {};  // channel id of each active channel
   uint32_t n = 0;                 // samples per channel
   int32_t trig_index = -1;        // index of the trigger sample, -1 if none
+  uint8_t trig_src = 0;           // channel the trigger actually used
   float sample_rate = 0.0f;       // measured, Hz
   bool has_bands = false;         // per-sample band codes valid (AUTO active)
   const float* data[NUM_CHANNELS] = {};  // indexed by channel id
@@ -55,7 +56,7 @@ float scopeAutoReading(const Settings& s, uint8_t& band);
 // CAL BANDS: samples the direct path and both gain stages `count` times at
 // `rate_hz`, then fits V_stage = off + gain * V_in by least squares over the
 // samples where each stage is being driven, and finds the input range where it
-// was driven (window) and any gap around its idle point (hole).
+// was driven (window) and where inside it the mux never drives it (hole).
 struct StageFit {
   bool ok = false;
   uint32_t n = 0;        // samples used
@@ -63,8 +64,11 @@ struct StageFit {
   float off_v = 0.0f;    // stage output at 0 V input
   float lo_v = 0.0f;     // input range over which the stage was driven
   float hi_v = 0.0f;
-  float hole_lo_v = 0.0f;  // region around the idle point where it was never
-  float hole_hi_v = 0.0f;  //   driven (lo == hi: none)
+  float hole_lo_v = 0.0f;  // inputs inside the window where the mux never
+  float hole_hi_v = 0.0f;  //   drives the stage (lo == hi: none)
+  bool center_ok = false;  // driven around its idle point (see readAutoPath)
   float resid_v = 0.0f;    // RMS fit residual, input-referred
 };
-void scopeFitStages(const Settings& s, uint32_t count, uint32_t rate_hz, StageFit fit[NUM_STAGES]);
+// sweep_lo/hi: the input range the signal covered during the measurement.
+void scopeFitStages(const Settings& s, uint32_t count, uint32_t rate_hz, StageFit fit[NUM_STAGES],
+                    float& sweep_lo, float& sweep_hi);

@@ -68,7 +68,7 @@ void sendCaptureBinary(bool single) {
   h.flags = (g_cap.trig_index >= 0 ? proto::FLAG_TRIGGERED : 0) |
             (g_cap.has_bands ? proto::FLAG_HAS_BANDS : 0) |
             (single ? proto::FLAG_SINGLE : 0);
-  h.trig_src = g_cfg.trig_src;
+  h.trig_src = g_cap.trig_src;
   h.nsamples = g_cap.n;
   h.trig_index = g_cap.trig_index;
   h.sample_rate = g_cap.sample_rate;
@@ -131,7 +131,7 @@ void printHelp() {
   reply("                              input range where a gain stage may be used");
   reply("  CAL ZERO                    input shorted to GND: measure mid-points");
   reply("  CAL GAIN <V>                known DC input: measure DIRECT/EXT gains");
-  reply("  CAL BANDS                   slow signal swept over +/-1 V: fit both gain stages");
+  reply("  CAL BANDS                   slow (<= 10 Hz) sweep over +/-1 V: fit both gain stages");
   reply("  PROBE                       raw reading of every net (board bring-up)");
   reply("  INFO | SAVE | LOAD | DEFAULTS");
 }
@@ -161,9 +161,9 @@ void printInfo() {
         snprintf(hole, sizeof hole, " except %+.3f..%+.3f V", g_cfg.hole_lo_v[b],
                  g_cfg.hole_hi_v[b]);
       }
-      reply("cal stage %u: gain=%.4f off=%.4f V window %+.3f..%+.3f V%s", b + 1,
+      reply("cal stage %u: gain=%.4f off=%.4f V window %+.3f..%+.3f V%s, %s near idle", b + 1,
             g_cfg.stage_gain[b], g_cfg.stage_off_v[b], g_cfg.window_lo_v[b],
-            g_cfg.window_hi_v[b], hole);
+            g_cfg.window_hi_v[b], hole, g_cfg.stage_center_ok[b] ? "trusted" : "not trusted");
     } else {
       reply("cal stage %u: gain=%.4f off=%.4f V window OFF", b + 1, g_cfg.stage_gain[b],
             g_cfg.stage_off_v[b]);
@@ -239,7 +239,7 @@ void calZero() {
 
 void calGain(float known_v) {
   if (!isfinite(known_v) || fabsf(known_v) < 0.05f) {
-    reply("ERR apply and pass a known DC voltage of at least 50 mV, e.g. CAL GAIN 1.000");
+    reply("ERR apply and pass a known DC voltage of at least 50 mV, e.g. CAL GAIN 0.500");
     return;
   }
   struct Path {
@@ -254,6 +254,12 @@ void calGain(float known_v) {
   for (const Path& p : paths) {
     RawReading rd;
     if (!scopeMeasureRaw(p.src, 2048, rd)) continue;
+    if (p.src == RAW_DIRECT && (rd.min_v < ADC_LINEAR_MIN_V || rd.max_v > ADC_LINEAR_MAX_V)) {
+      reply("CAL GAIN DIRECT: skipped, D2 read %.3f V, outside the ADC's linear %.2f..%.2f V; "
+            "use a voltage between about %+.2f and %+.2f V", rd.mean_v, ADC_LINEAR_MIN_V,
+            ADC_LINEAR_MAX_V, ADC_LINEAR_MIN_V - p.mid + 0.05f, ADC_LINEAR_MAX_V - p.mid - 0.05f);
+      continue;
+    }
     float delta = rd.mean_v - p.mid;
     if (fabsf(delta) < 0.01f) {
       reply("CAL GAIN %s: skipped, node moved only %.1f mV from mid", p.name, delta * 1000.0f);
@@ -266,15 +272,28 @@ void calGain(float known_v) {
 }
 
 void calBands() {
-  reply("CAL BANDS: sampling for 2 s; keep a slow signal (<= 50 Hz) sweeping across +/-1 V");
+  reply("CAL BANDS: sampling for 2 s; keep a slow signal (<= 10 Hz) sweeping across +/-1 V");
   StageFit fit[NUM_STAGES];
-  scopeFitStages(g_cfg, 4000, 2000, fit);
+  float sweep_lo, sweep_hi;
+  scopeFitStages(g_cfg, 4000, 2000, fit, sweep_lo, sweep_hi);
+  if (sweep_hi - sweep_lo < 0.5f) {
+    reply("ERR CAL BANDS: the input only covered %+.3f..%+.3f V; sweep at least +/-1 V. "
+          "Calibration unchanged.", sweep_lo, sweep_hi);
+    return;
+  }
   for (uint8_t b = 0; b < NUM_STAGES; b++) {
     const StageFit& f = fit[b];
-    if (!f.ok) {
+    if (!f.ok && f.n < 100) {
       g_cfg.window_lo_v[b] = g_cfg.window_hi_v[b] = 0.0f;
-      reply("CAL BANDS stage %u: only %lu driven samples; stage disabled. Is its CD4052 channel "
-            "ever selected? (see README: nested windows select Y3)", b + 1, (unsigned long)f.n);
+      g_cfg.stage_center_ok[b] = 0;
+      reply("CAL BANDS stage %u: never driven while the input swept %+.3f..%+.3f V; stage "
+            "disabled. Check its CD4052 channel (README: nested windows select Y3).", b + 1,
+            sweep_lo, sweep_hi);
+      continue;
+    }
+    if (!f.ok) {
+      reply("CAL BANDS stage %u: driven over too narrow a range to fit; calibration unchanged. "
+            "Sweep further across its window.", b + 1);
       continue;
     }
     g_cfg.stage_gain[b] = f.gain;
@@ -283,6 +302,7 @@ void calBands() {
     g_cfg.window_hi_v[b] = f.hi_v;
     g_cfg.hole_lo_v[b] = f.hole_lo_v;
     g_cfg.hole_hi_v[b] = f.hole_hi_v;
+    g_cfg.stage_center_ok[b] = f.center_ok;
     reply("CAL BANDS stage %u: gain=%.4f off=%.4f V window %+.3f..%+.3f V, fit residual "
           "%.2f mV rms over %lu samples", b + 1, f.gain, f.off_v, f.lo_v, f.hi_v,
           f.resid_v * 1000.0f, (unsigned long)f.n);
@@ -415,7 +435,7 @@ void handleCommand(char* line) {
     reply("OK ADSRANGE 0x%lX (%s)", (unsigned long)u, range);
   } else if (!strcmp(cmd, "MID") || !strcmp(cmd, "PGAIN")) {
     bool mid = !strcmp(cmd, "MID");
-    if ((idx = lookup(a1, kCalPathNames, 2)) < 0 || !parseFloat(a2, f) || (!mid && f == 0.0f)) {
+    if ((idx = lookup(a1, kCalPathNames, 2)) < 0 || !parseFloat(a2, f) || (!mid && fabsf(f) < 1e-6f)) {
       return reply("ERR %s DIRECT|EXT <%s>", cmd, mid ? "volts" : "gain");
     }
     float* target = mid ? (idx == 0 ? &g_cfg.direct_mid_v : &g_cfg.ext_mid_v)
@@ -423,7 +443,7 @@ void handleCommand(char* line) {
     *target = f;
     reply("OK %s %s %.5f", cmd, kCalPathNames[idx], f);
   } else if (!strcmp(cmd, "STAGE")) {
-    if (!parseUint(a1, u) || u < 1 || u > NUM_STAGES || !parseFloat(a2, f) || f == 0.0f ||
+    if (!parseUint(a1, u) || u < 1 || u > NUM_STAGES || !parseFloat(a2, f) || fabsf(f) < 1e-6f ||
         (a3 && !parseFloat(a3, f2))) {
       return reply("ERR STAGE <1|2> <gain> [offset volts]");
     }
@@ -440,13 +460,15 @@ void handleCommand(char* line) {
       return reply("OK WINDOW %lu OFF", (unsigned long)u);
     }
     if (!parseFloat(a2, f) || !parseFloat(a3, f2) || f >= f2 ||
-        (a4 && (!parseFloat(a4, f3) || !parseFloat(a5, f4) || f3 >= f4))) {
-      return reply("ERR WINDOW <1|2> <lo> <hi> [<hole lo> <hole hi>] with lo < hi");
+        (a4 && (!parseFloat(a4, f3) || !parseFloat(a5, f4) || f3 > f4))) {
+      return reply("ERR WINDOW <1|2> <lo> <hi> [<hole lo> <hole hi>], lo < hi (hole 0 0 clears it)");
     }
     g_cfg.window_lo_v[u - 1] = f;
     g_cfg.window_hi_v[u - 1] = f2;
-    g_cfg.hole_lo_v[u - 1] = a4 ? f3 : 0.0f;
-    g_cfg.hole_hi_v[u - 1] = a4 ? f4 : 0.0f;
+    if (a4) {  // otherwise keep the current (e.g. measured) hole
+      g_cfg.hole_lo_v[u - 1] = f3;
+      g_cfg.hole_hi_v[u - 1] = f4;
+    }
     reply("OK WINDOW %lu %+.3f..%+.3f hole %+.3f..%+.3f", (unsigned long)u, f, f2,
           g_cfg.hole_lo_v[u - 1], g_cfg.hole_hi_v[u - 1]);
   } else if (!strcmp(cmd, "CAL")) {

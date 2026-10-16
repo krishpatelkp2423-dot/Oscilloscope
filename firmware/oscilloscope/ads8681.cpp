@@ -56,15 +56,26 @@ bool ADS8681::begin(SPIClass& spi, int cs_pin, int rst_pin, uint32_t spi_hz) {
 
   // Explicitly select SPI-00 (CPOL 0, CPHA 0), SDO-0 only, and conversion
   // data in the output word. These are the reset defaults; writing them makes
-  // the driver independent of whatever state the chip was left in.
+  // the driver independent of whatever state the chip was left in (they are
+  // written again below if the chip was still coming out of reset).
   writeReg(REG_SDI_CTL, 0x0000);
   writeReg(REG_SDO_CTL, 0x0000);
   writeReg(REG_DATAOUT_CTL, 0x0000);
 
   // Presence check: write a non-zero code and read it back. A missing chip
-  // reads back 0x0000 or 0xFFFF on a floating/stuck MISO line.
-  writeReg(REG_RANGE_SEL, RANGE_UNI_1V25REF);
-  present_ = (readReg(REG_RANGE_SEL) & 0x004F) == RANGE_UNI_1V25REF;
+  // reads back 0x0000 or 0xFFFF on a floating/stuck MISO line. Retry for up to
+  // 50 ms in case the power-on reset is still finishing.
+  present_ = false;
+  for (int attempt = 0; attempt < 10 && !present_; attempt++) {
+    if (attempt) {
+      delay(5);
+      writeReg(REG_SDI_CTL, 0x0000);
+      writeReg(REG_SDO_CTL, 0x0000);
+      writeReg(REG_DATAOUT_CTL, 0x0000);
+    }
+    writeReg(REG_RANGE_SEL, RANGE_UNI_1V25REF);
+    present_ = (readReg(REG_RANGE_SEL) & 0x004F) == RANGE_UNI_1V25REF;
+  }
   if (present_) setRange(range_);
   return present_;
 }
