@@ -68,14 +68,14 @@ Two window comparators decide how big the signal is. Each window is two MCP6544 
 - **Window 1** uses the R19 / R20 / R21 ladder (5 kΩ / 2 kΩ / 5 kΩ across 3.3 V). Its thresholds are 1.375 V and 1.925 V on `Input`, which is ±0.275 V at the probe.
 - **Window 2** uses the R15 / R16 / R17 ladder. Its design range is 0.95–2.35 V on `Input`, which is ±0.70 V at the probe.
 
-The two window signals drive the CD4052's select lines, and the mux routes `Input` to one of two **inverting** gain stages. Both stages are biased at the R24/R27 mid-rail (V_r ≈ 1.65 V). Stage 1 (R7 = 255 kΩ feedback) feeds XIAO pin D0, and stage 2 feeds D1:
+The two window signals drive the CD4052's select lines, and the mux routes `Input` to one of two **inverting** gain stages. Both stages are biased at the R24/R27 mid-rail (V_ref2 ≈ 1.65 V). Stage 1 (R7 = 255 kΩ feedback) feeds XIAO pin D0, and stage 2 feeds D1:
 
 ```
-V_D0 = V_r − G1 · (V_ls − V_r)        G1 ≈ 5.5   (window 1: ±0.275 V → about 0.14 … 3.16 V)
-V_D1 = V_r − G2 · (V_ls − V_r)        G2 ≈ 2.36  (window 2: ±0.70 V)
+V_D0 = V_ref2 − G1 · (V_ls − V_ref2)        G1 ≈ 5.5   (window 1: ±0.275 V → about 0.14 … 3.16 V)
+V_D1 = V_ref2 − G2 · (V_ls − V_ref2)        G2 ≈ 2.36  (window 2: ±0.70 V)
 ```
 
-A stage whose mux channel is off has no current in its input resistor, so it sits at its idle level V_r. The LM397/LPV7215 comparator watches for `Input` going above VDD and inhibits the mux (INH) when it does.
+A stage whose mux channel is off has no current in its input resistor, so it sits at its idle level V_ref2. The LM397/LPV7215 comparator watches for `Input` going above VDD and inhibits the mux (INH) when it does.
 
 **How the firmware uses it.** The XIAO doesn't see the mux select lines, so it works out which stage is live from the readings. Every V1 sample uses the same four reads: D2, D0, D1, D2. Then, highest gain first, the firmware accepts a stage only if all of these hold:
 
@@ -292,10 +292,12 @@ The CRC is CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over `type … payload`
 
 This chapter works through the math behind the board, from the Laplace transform of the analog front end to the checksum on the USB link. Every number is computed from the schematic, from datasheet typical values, or from an assumption that is labelled where it is used. **None of it is a bench measurement.** Each section was checked independently by recomputing its numbers and re-deriving its equations.
 
-- [T1. Laplace transforms and the analog front end](#t1-laplace-transforms-and-the-analog-front-end): transfer functions, bandwidth and rise time of every stage, the ADS8681's filter, input loading, compensated attenuators.
-- [T2. Sampling: from Laplace to the z-transform and the FFT](#t2-sampling-from-laplace-to-the-z-transform-and-the-fft): impulse sampling, aliasing, zero-order hold, the ADS8681's one-sample delay, spectra, reconstruction, jitter.
-- [T3. Resolution and noise](#t3-resolution-and-noise): quantization, SQNR and ENOB, thermal and op-amp noise, aliased noise, supply ripple, hysteresis, averaging, and a noise budget per path.
-- [T4. The math inside the firmware and the measurements](#t4-the-math-inside-the-firmware-and-the-measurements): reconstruction, window thresholds, the mux logic as Boolean algebra, V1 stage selection, least-squares calibration, triggering, measurements, CRC.
+- [T1. Laplace transforms and the analog front end](#t1-laplace-transforms-and-the-analog-front-end): transfer functions, bandwidth and rise time of every stage and every path, the ADS8681's filter, input loading, compensated attenuators, input protection.
+- [T2. Sampling: from Laplace to the z-transform and the FFT](#t2-sampling-from-laplace-to-the-z-transform-and-the-fft): impulse sampling, aliasing and anti-aliasing filters, zero-order hold, the ADS8681's one-sample delay, spectra, reconstruction, jitter.
+- [T3. Resolution and noise](#t3-resolution-and-noise): quantization, SQNR and ENOB, thermal and op-amp noise, aliased noise, supply ripple, hysteresis, averaging and hum rejection, a noise budget per path, and how the three paths compare.
+- [T4. The math inside the firmware and the measurements](#t4-the-math-inside-the-firmware-and-the-measurements): reconstruction, window thresholds, the mux logic as Boolean algebra, V1 stage selection, least-squares calibration, triggering, measurements, AC coupling and duty cycle, CRC.
+
+**Notation.** $`V_\text{in}`$ is the probe voltage (RawInput) and $`V_\text{ls} = V_\text{in} + V_\text{ref}`$ the level-shifted node. $`V_\text{ref}`$ (also written $`V_\text{ref1}`$) is the buffered 1.65 V from R1/R2, and $`V_\text{ref2}`$ the unbuffered R24/R27 mid-rail of the gain stages. $`G_1, G_2`$ are the stage gain magnitudes (5.5 and 2.36) and $`g_1 = -G_1`$, $`g_2 = -G_2`$ the signed gains the firmware stores. $`f_s`$ is the sample rate and $`T = 1/f_s`$, except in kT terms, where $`T`$ is absolute temperature. $`N`$ is ADC bits and $`n`$ the record length.
 
 **Key results**
 
@@ -310,6 +312,7 @@ This chapter works through the math behind the board, from the Laplace transform
 | Input-referred step: direct / stage 1 / stage 2 / ADS8681 | 1 mV / 0.18 mV / 0.42 mV / 78 µV | T3, T4.1 |
 | Front-end noise in every native sample (aliased) | ≈ 194 µV rms at the probe | T3 |
 | ADS8681 noise on the ±2.56 V range | ≈ 57 µV rms (≈ 14.7 effective bits) | T3 |
+| Dynamic range: direct / auto-ranged / ADS8681 | 55 / 69 / 86 dB (if the ESP32 ADC's own noise is 2 LSB) | T3.11 |
 | Window 1 from R19/R20/R21 | ±0.275 V at the probe; as drawn, gain stage 1 can never be selected | T4.2, T4.4 |
 | Frequency read-out, 1 kHz sine with 5 mV noise | σ ≈ 0.02 Hz | T4.10 |
 
@@ -435,7 +438,7 @@ This is where the firmware's signed gains $`g_1 = -G_1`$ and $`g_2 = -G_2`$, and
 V_\text{out} = V_\text{ref1} + (1 + G)\left(V_\text{ref2} - V_\text{ref1}\right) - G\,V_\text{in}
 ```
 
-*Example, assuming 1 % resistors:* the worst-case R24/R27 divider sits 16.5 mV low, which moves stage 1's offset by $`6.5 \times 16.5\,\text{mV} = 107\,\text{mV}`$. If R1/R2 err the other way, the difference is 33 mV and the shift is 0.21 V. CAL BANDS fits $`\text{off}_b`$ and absorbs this offset.
+*Example, assuming 1 % resistors:* the worst-case R24/R27 divider sits 16.5 mV low, which moves stage 1's offset by $`6.5 \times 16.5\,\text{mV} = 107\,\text{mV}`$. If R1/R2 err 16.5 mV the other way, the offset moves by $`\delta_1 + (1 + G)(\delta_2 - \delta_1) = 16.5 - 214.5 = -198\,\text{mV}`$, about 0.20 V. CAL BANDS fits $`\text{off}_b`$ and absorbs this offset.
 
 **Output range.** The design gains are 3.3 V divided by the design window width, so each design window's edges land on the rails (stage 1 was sized for the earlier ±0.30 V window). With the R19/R20/R21 window-1 ladder (±0.275 V), stage 1 swings from 0.14 V to 3.16 V. Stage 2 swings from about 0 V to 3.30 V over ±0.70 V. That is wider than the ESP32's linear range, so only part of each window is usable. The firmware rejects any stage reading outside that range and falls back to the direct path:
 
@@ -548,7 +551,7 @@ CAL ZERO (input shorted, $`R_s = 0`$) cannot remove these errors, because they d
 **Open input.** RawInput floats to $`V_\text{th} \approx 1.65\,\text{V}`$, the top of the range. (Modelling the ADS8681 as 1 MΩ to ground instead gives 1.618 V.) Each path then reads:
 
 - **EXT:** about +1.65 V.
-- **DIRECT:** $`V_\text{ls} \approx 3.3\,\text{V}`$ clips the ESP32 ADC, so the reconstructed value is roughly the clip level minus 1.65 V: about +0.85 V on a C3 (2.5 V limit) or +1.45 V on an S3 (3.1 V limit).
+- **DIRECT:** $`V_\text{ls} \approx 3.3\,\text{V}`$ clips the ESP32 ADC, so the reconstructed value is roughly the clip level minus 1.65 V: about +0.85 to +1.15 V on a C3 (readings saturate somewhere between 2.5 and 2.8 V) or about +1.45 V on an S3 (3.1 V limit).
 - **AUTO:** falls back to the direct reading, because that reading is outside both stage windows.
 
 An unconnected probe therefore shows a large positive constant, not 0 V and not noise, which makes a handy bring-up check.
@@ -583,7 +586,7 @@ As an example, take a ×10 divider into a 1 MΩ input: $`R_t`$ = 9 MΩ, $`R_b`$ 
 | 2.60 pF | 0.115 | +15.0 %, decays with $`\tau_p`$ = 20.3 µs | spiky corners (over-compensated) |
 | 1.90 pF | 0.0868 | -13.2 %, recovers with $`\tau_p`$ = 19.7 µs | rounded corners (under-compensated) |
 
-**Applying this to the board.** The firmware command `PGAIN DIRECT|EXT <g>` sets the gain from the probe to the ADC node for the direct and ADS8681 paths. With a ratio-$`k`$ attenuator, either set each gain to $`k`$ times its calibrated value (DIRECT 1.0 becomes 0.1 for ×10), or apply a known DC voltage at the attenuator input and run CAL GAIN, which measures the product directly and overwrites PGAIN. Then run CAL ZERO, and CAL BANDS so the gain-stage fits and windows are also referred to the attenuator input.
+**Applying this to the board.** The firmware command `PGAIN DIRECT|EXT <g>` sets the gain from the probe to the ADC node for the direct and ADS8681 paths. With a ratio-$`k`$ attenuator, either set each gain to $`k`$ times its calibrated value (DIRECT 1.0 becomes 0.1 for ×10), or recalibrate with the attenuator in place, in the usual order: CAL ZERO, then CAL GAIN with a known DC voltage at the attenuator input (it measures the product directly and overwrites PGAIN), then CAL BANDS so the gain-stage fits and windows are also referred to the attenuator input, then SAVE.
 
 The divider cannot go straight onto RawInput, though, because the load is 19.6 kΩ to 1.649 V rather than 1 MΩ to ground. Two things go wrong:
 
@@ -606,6 +609,87 @@ Trim $`C_t`$ with a bench scope. In the example, the compensation error decays w
 | Source loading | $`R_L/(R_s + R_L)`$ plus offset | DC | $`R_L`$ = 19.6 kΩ to 1.649 V |
 
 The native-ADC paths (V1, V2) have MHz of analog bandwidth, so sampling limits them, not the analog circuit. The 16-bit path (V3) is limited by its own 15 kHz filter.
+
+#### T1.9 Rise time of each complete path, and what the scope can resolve
+
+Cascaded stages that do not overshoot combine roughly as a root-sum-square. The rule is exact for Gaussian step responses and a good approximation for chains of single poles:
+
+```math
+t_{r,\text{path}} \approx \sqrt{t_{r,1}^2 + t_{r,2}^2 + \cdots}, \qquad f_{-3\,\text{dB,path}} \approx \frac{0.35}{t_{r,\text{path}}}
+```
+
+With the typical 50 MHz GBW of T1.3 and T1.4, and the ADS8681 filter model of T1.5:
+
+| Path | Stages | Rise time | Bandwidth |
+|---|---|---|---|
+| V2 direct (D2) | level shifter | 14.0 ns | ≈ 25 MHz |
+| V1 stage 2 (D1) | level shifter, then stage 2 (23.5 ns) | 27.4 ns | ≈ 12.8 MHz |
+| V1 stage 1 (D0) | level shifter, then stage 1 (45.5 ns) | 47.6 ns | ≈ 7.4 MHz |
+| V3 ADS8681 | internal filter | ≈ 23 µs | ≈ 15 kHz |
+
+A measured edge combines the signal's own rise time with the instrument's in the same way, so the true value can be backed out:
+
+```math
+t_{r,\text{meas}} \approx \sqrt{t_{r,\text{sig}}^2 + t_{r,\text{scope}}^2} \;\Rightarrow\; t_{r,\text{sig}} \approx \sqrt{t_{r,\text{meas}}^2 - t_{r,\text{scope}}^2}
+```
+
+To read within about 5 % without this correction, the instrument must be at least three times faster than the edge, because $`\sqrt{1 + 1/9} = 1.054`$.
+
+**Sampling sets the real limit.** The GUI joins samples with straight lines (T2.8), so even a perfect step is drawn with a finite slope. A simulation of a sampled edge at many sample phases (not a bench measurement) gives these 10-90 % rise times, read from the straight-line trace:
+
+- An ideal step always reads $`0.8T`$. A fast but finite edge reads between $`0.8T`$ and $`1.6T`$, depending on whether a sample lands part-way up it.
+- A Gaussian edge with $`t_r = 3T`$ reads 0 to 9 % high (6 % on average).
+- With $`t_r = 5T`$ the reading is 0 to 3 % high.
+
+A practical rule is therefore three samples on the edge:
+
+```math
+t_{r,\min} \approx 3T = \frac{3}{f_s}
+```
+
+| Sample rate | $`T`$ | Smallest edge measurable to about 10 % |
+|---|---|---|
+| 10 kS/s (default) | 100 µs | ≈ 300 µs |
+| ≈ 22 kS/s (fastest AUTO, T2.10) | 45 µs | ≈ 140 µs |
+| ≈ 89 kS/s (fastest DIRECT, T2.10) | 11 µs | ≈ 34 µs |
+
+The native paths' analog rise times (14-48 ns) are about three orders of magnitude shorter, so on V1 and V2 the sample rate, not the circuit, sets the displayed rise time. On V3 the ≈ 23 µs filter only dominates once $`0.8T`$ falls below it, which happens above about 35 kS/s.
+
+#### T1.10 Input protection: how much overvoltage the front end survives
+
+Above ±1.65 V the level shifter clips at the rails. That protects D0-D2: an op-amp output cannot leave 0-3.3 V, so the ESP32 pins, the comparators and the mux only ever see in-range voltages. Only two things see the raw probe voltage: R3 together with the TSV794's non-inverting input, and the ADS8681's AIN_P.
+
+The op-amp input has ESD diodes to VDD and GND. Model them as clamps at $`V_{DD} + V_D`$ and $`-V_D`$, with $`V_D \approx 0.5`$ V (assumed). Because $`V_+ = (V_\text{in} + V_\text{ref})/2`$, a diode starts to conduct at
+
+```math
+V_\text{in} > 2\,(V_{DD} + V_D) - V_\text{ref} = 5.95\ \text{V}, \qquad V_\text{in} < -2V_D - V_\text{ref} = -2.65\ \text{V}
+```
+
+Beyond those points, with $`R_3 = R_6 = R`$ = 10 kΩ, the diode carries the current R3 brings in, minus the current R6 returns to the 1.65 V buffer:
+
+```math
+I_D = \frac{V_\text{in} - 2(V_{DD} + V_D) + V_\text{ref}}{R}\ \ (\text{positive}), \qquad I_D = \frac{-2V_D - V_\text{ref} - V_\text{in}}{R}\ \ (\text{negative}), \qquad P_{R3} = \frac{(V_\text{in} - V_+)^2}{R}
+```
+
+| $`V_\text{in}`$ | $`V_+`$ | Diode current | R3 dissipation |
+|---|---|---|---|
+| +5 V | 3.33 V (not clamped) | 0 | 0.28 mW |
+| +12 V | 3.8 V | 0.61 mA | 6.7 mW |
+| +20 V | 3.8 V | 1.41 mA | 26 mW |
+| −5 V | −0.5 V | 0.24 mA | 2.0 mW |
+| −12 V | −0.5 V | 0.94 mA | 13 mW |
+| −20 V | −0.5 V | 1.74 mA | 38 mW |
+
+Three limits apply, and the tightest one wins:
+
+- **Diode current.** A typical 10 mA input-current rating (check ST's absolute-maximum table) is reached only near ±100 V.
+- **R3 power.** The PCB uses through-hole resistors. Assuming ¼ W parts, R3 limits the input to about +54 V and −50 V.
+- **ADS8681.** TI specifies input overvoltage protection to ±20 V on AIN_P with AVDD powered (check the absolute-maximum table; the limit is lower with AVDD off). This is the binding limit: about ±20 V with the board powered.
+
+There are two side effects:
+
+- **Rail injection.** The clamp current flows into the 3.3 V rail. The XIAO's regulator can only source current, so the rail holds only while the board draws more than is injected. 1-2 mA is far below the ESP32's own draw.
+- **Back-powering.** With the board unpowered ($`V_{DD} = V_\text{ref} = 0`$), $`V_+`$ clamps at about 0.5 V once the input exceeds about 1 V. A 5 V signal then pushes about 0.4 mA into the dead rail through R3. Do not drive the input while the board is off, or add a series resistor and Schottky clamps (that resistor then adds to $`R_s`$ in T1.6).
 
 ### T2. Sampling: from Laplace to the z-transform and the FFT
 
@@ -718,6 +802,31 @@ Every one of these limits is roughly 500 to 5000 times $`f_s/2 = 5\,\text{kHz}`$
 At this firmware's 10 to 20 kS/s the filter corner lies above Nyquist, so it gives little protection against aliasing. A 12 kHz input sampled at 10 kS/s still reaches the converter at about 79% of its amplitude and appears at 2 kHz. A 19 kHz input arrives at about 60% and appears at 1 kHz. The filter also costs some accuracy inside the band. A 5 kHz sine reads about 4% low on V3, while at 1 kHz the loss is only 0.02 dB.
 
 The V3 path rejects high-frequency interference and wideband noise much better than V1 and V2, about 26 dB down at 100 kHz. It is still **not** alias-free at the default rate. Under this model, 40 dB of attenuation at $`f_s/2`$ would need $`f_s/2 \ge 232\,\text{kHz}`$, that is $`f_s \ge 464\,\text{kS/s}`$, far beyond a software-paced loop. Below that rate it is up to the user to keep inputs under $`f_s/2`$. The alternative is to add an external low-pass filter.
+
+**Sizing an anti-aliasing filter for the native paths.** For a record to be alias-free from DC to $`f_p`$, every input between $`f_s - f_p`$ and $`f_s + f_p`$ must be attenuated, because those frequencies fold into $`0 \ldots f_p`$. An $`N`$th-order Butterworth low-pass with corner $`f_c`$ gives
+
+```math
+|H(f)| = \frac{1}{\sqrt{1 + (f/f_c)^{2N}}}, \qquad A(f_s - f_p) \approx 20N\log_{10}\frac{f_s - f_p}{f_c}\ \text{dB}, \qquad N \ge \frac{A_\text{req}}{20\log_{10}\big((f_s - f_p)/f_c\big)}
+```
+
+Take the default 10 kS/s and the 10-samples-per-period passband of T2.8, $`f_p`$ = 1 kHz. The first folding band then starts at 9 kHz:
+
+| Filter | Loss at 1 kHz | Attenuation at 9 kHz |
+|---|---|---|
+| 1st-order RC, $`f_c`$ = 15.9 kHz (the noise filter in T3.5) | −0.02 dB | −1.2 dB |
+| 1st-order RC, $`f_c`$ = 1.59 kHz | −1.45 dB | −15.2 dB |
+| 2nd-order Butterworth, $`f_c`$ = 2 kHz | −0.26 dB | −26.1 dB |
+| 4th-order Butterworth, $`f_c`$ = 1.5 kHz | −0.17 dB | −62.3 dB |
+
+If the ESP32 ADC delivers about 9-10 effective bits (an assumption; T3.2), pushing aliases down to its noise floor (54-60 dB) takes roughly a 4th-order filter: two Sallen-Key sections per pin, which means another quad op-amp. A single RC mainly limits the noise bandwidth (T3.5). It does not make the native paths alias-free.
+
+**Charge kickback.** The ESP32 has one SAR sampling capacitor $`C_s`$, which is switched between D2, D0 and D1. In AUTO, each read therefore starts with $`C_s`$ still holding another pin's voltage, up to about 3 V away. A capacitor $`C`$ at the pin shares charge with it:
+
+```math
+\Delta V_\text{kick} = \Delta V\,\frac{C_s}{C_s + C} \le \frac{\text{LSB}}{2} \;\Rightarrow\; C \ge C_s\left(\frac{2\,\Delta V}{\text{LSB}} - 1\right)
+```
+
+$`C_s`$ is not documented. For an assumed 5 pF and $`\Delta V`$ = 3 V the rule asks for at least about 40 nF, which agrees with Espressif's recommended 100 nF at the ADC pad. With 3 V of swing, 10 nF gives 1.5 mV of kickback (1.9 nominal LSB) and 100 nF gives 0.15 mV. To keep a 15.9 kHz corner with the larger capacitor, use R = 100 Ω and C = 100 nF, and take the op-amp's feedback from its own output, ahead of R, so that the loop sees a mostly resistive load at high frequency.
 
 #### T2.5 Holding a sample: the zero-order hold
 
@@ -858,13 +967,13 @@ That only works if the trigger-to-sample delay is known to a small fraction of $
 
 Rounding the period to whole cycles has a negligible effect. For example, 7 kS/s at 160 MHz becomes 22857 cycles, or 7000.04 S/s (+6.25 ppm).
 
-Every sample in a given mode costs the same fixed sequence of reads: one native read for DIRECT, four for AUTO with both stages enabled (D2, D0, D1, D2), and an ADS8681 SPI frame added for EXT and MODE ALL. Before each capture the firmware times four dry-run samples and never paces faster than the slowest one plus 12.5 % margin. At an assumed 10 to 20 µs per read, AUTO therefore runs at up to about 11 to 22 kS/s, and DIRECT at up to about 44 to 89 kS/s. Asking for more gives evenly spaced samples at the achievable rate, not unevenly spaced ones. An interrupt can still delay an individual sample; the loop then shortens the next interval to get back on the grid, unless it has fallen more than a whole period behind. The firmware measures the rate it actually achieved and sends it with the frame. $`n`$ samples span $`n-1`$ intervals:
+Every sample in a given mode costs the same fixed sequence of reads: one native read for DIRECT, four for AUTO with both stages enabled (D2, D0, D1, D2), and an ADS8681 SPI frame added for EXT and MODE ALL. Before each capture the firmware times four dry-run samples and never paces faster than the slowest one plus 12.5 % margin. At an assumed 10 to 20 µs per read, AUTO therefore runs at up to about 11 to 22 kS/s, and DIRECT at up to about 44 to 89 kS/s. Asking for more gives evenly spaced samples at the achievable rate, not unevenly spaced ones. An interrupt can still delay an individual sample; the loop then shortens the next interval to get back on the grid, unless it has fallen more than a whole period behind. The firmware measures the rate it actually achieved and sends it with the frame. It counts all $`n_\text{acq}`$ samples of the acquisition, including those overwritten in the ring while waiting for the trigger (T4.9), which span $`n_\text{acq} - 1`$ intervals:
 
 ```math
-\hat f_s = \frac{n-1}{t_{\text{last}} - t_{\text{first}}}
+\hat f_s = \frac{n_\text{acq} - 1}{t_{\text{last}} - t_{\text{first}}}
 ```
 
-With 1 µs timestamps over a 99.9 ms span ($`n = 1000`$ at 10 kS/s), timestamp resolution contributes at most 10 ppm. The timestamps and the cycle counter both run from the board's crystal, so $`\hat f_s`$ cannot detect the crystal's own frequency error (assumed to be tens of ppm). That error remains as a small scale error on the time axis. $`\hat f_s`$ is also an average, so it does not show the occasional interrupt-delayed sample.
+With 1 µs timestamps over a span of at least 99.9 ms (a 1000-sample record at 10 kS/s), timestamp resolution contributes at most 10 ppm. The timestamps and the cycle counter both run from the board's crystal, so $`\hat f_s`$ cannot detect the crystal's own frequency error (assumed to be tens of ppm). That error remains as a small scale error on the time axis. $`\hat f_s`$ is also an average, so it does not show the occasional interrupt-delayed sample.
 
 **Jitter.** Suppose each sampling instant has a random error with rms value $`\sigma_t`$. The voltage error is then approximately the signal's slope times the timing error. For a sine of amplitude $`A`$, the rms slope is $`2\pi f A/\sqrt2`$ and the rms signal is $`A/\sqrt2`$, so $`A`$ cancels:
 
@@ -906,7 +1015,7 @@ Three practical notes for the native path:
 
 - **The true code step depends on the chip.** At the highest attenuation the voltage at code 4095 is set by the chip's internal reference (1.0 to 1.2 V from chip to chip, per Espressif) times the attenuation, not by VDD. One ESP32-C3 user reports code 4095 at about 2.8 V, which is about 0.68 mV per code. This section uses the nominal 805.7 µV.
 - **The reported step is 1 mV.** `analogReadMilliVolts()` returns an integer number of millivolts, so the firmware only ever sees 1 mV steps. This second quantizer is slightly coarser than the nominal code step.
-- **The calibrated span is narrower than 0 to 3.3 V.** Espressif's ESP-IDF v4.4 pages give 0 to 2500 mV for the ESP32-C3 and 0 to 3100 mV for the ESP32-S3 at the highest attenuation. Espressif's 2025 ADC comparison article lists about 0 to 2900 mV for the S3. If a C6 is fitted, check its datasheet. On a C3 the direct path therefore saturates at $`V_{\text{ls}} = 2.5\,\text{V}`$, i.e. $`V_{\text{in}} = +0.85\,\text{V}`$, not +1.65 V. The inverting stages also clip for negative inputs: stage 1 below $`V_{\text{in}} = -0.155\,\text{V}`$ and stage 2 below $`-0.36\,\text{V}`$. For this reason a C3 build of the firmware uses 2.45 V instead of 3.00 V as its upper acceptance limit for stage readings.
+- **The calibrated span is narrower than 0 to 3.3 V.** Espressif's ESP-IDF v4.4 pages give 0 to 2500 mV for the ESP32-C3 and 0 to 3100 mV for the ESP32-S3 at the highest attenuation. Espressif's 2025 ADC comparison article lists about 0 to 2900 mV for the S3. If a C6 is fitted, check its datasheet. On a C3 the direct path therefore saturates at $`V_{\text{ls}} = 2.5\,\text{V}`$, i.e. $`V_{\text{in}} = +0.85\,\text{V}`$, not +1.65 V. The inverting stages also clip for negative inputs. A C3 build of the firmware therefore treats stage readings above 2.45 V (instead of 3.00 V) as clipped, so it uses stage 1 only above $`V_{\text{in}} = -0.145\,\text{V}`$ and stage 2 only above $`-0.339\,\text{V}`$.
 
 Why $`\sqrt{12}`$: if the input is "busy" (it moves by many LSBs between samples, or carries noise larger than about half an LSB), the rounding error $`e`$ is equally likely to be anywhere in $`[-\text{LSB}/2, +\text{LSB}/2]`$. Its probability density is the constant $`1/\text{LSB}`$, and its variance is
 
@@ -992,7 +1101,7 @@ Every resistor generates Johnson-Nyquist noise from the random motion of electro
 v_n = \sqrt{4kTRB},\qquad e_R = \sqrt{4kTR}\ \ \left[\text{V}/\sqrt{\text{Hz}}\right]
 ```
 
-At $`T = 300\,\text{K}`$, 10 kΩ gives 12.87 nV/√Hz and 20 kΩ gives 18.20 nV/√Hz (5 kΩ: 9.10; 255 kΩ: 65.0). Real filters do not cut off like a brick wall, so $`B`$ is the equivalent noise bandwidth: the width of a brick-wall filter that passes the same noise power.
+Here $`T`$ is absolute temperature, not the sample period. At $`T = 300\,\text{K}`$, 10 kΩ gives 12.87 nV/√Hz and 20 kΩ gives 18.20 nV/√Hz (5 kΩ: 9.10; 255 kΩ: 65.0). Real filters do not cut off like a brick wall, so $`B`$ is the equivalent noise bandwidth: the width of a brick-wall filter that passes the same noise power.
 
 ```math
 B_n = \int_0^{\infty} |H(f)|^2\,df =
@@ -1066,12 +1175,12 @@ A sample-and-hold takes an instantaneous snapshot. The variance of each sample i
 
 At $`f_s = 10\,\text{kS/s}`$, the level shifter's noise inside 0 to 5 kHz is only $`30.9\,\text{nV}\times\sqrt{5000} = 2.19\,\mu\text{V}`$. Yet each sample carries the full 194 µV: a factor of 88.6, or 39 dB. There is no RC filter in front of the ESP32 ADC pins, so the op-amps set the bandwidth. The ESP32's own sampling bandwidth is undocumented and is assumed to be wider.
 
-As an illustration of a possible change, sized for the default 10 kS/s: put 1 kΩ in series with 10 nF to GND at each ADC pin ($`f_{-3\text{dB}} = 15.9\,\text{kHz}`$, $`B_n = 25\,\text{kHz}`$). The series resistor matters because the TSV79x is rated stable with only about 1 nF of direct capacitive load (typical, ST). Espressif itself recommends a 100 nF capacitor at the ADC pad.
+As an illustration of a possible change, sized for the default 10 kS/s: put 100 Ω in series with 100 nF to GND at each ADC pin ($`f_{-3\text{dB}} = 15.9\,\text{kHz}`$, $`B_n = 25\,\text{kHz}`$). The series resistor matters because the TSV79x is rated stable with only about 1 nF of direct capacitive load (typical, ST). The 100 nF matches Espressif's recommendation for the ADC pad, and it is large enough to swamp the SAR's charge kickback when the ADC switches between pins (T2.4).
 
 - The direct-path noise would drop to 4.9 µV.
 - Stage 1 would drop to 39 µV at the pin (7.1 µV at the probe), and stage 2 to 23 µV (9.7 µV).
-- The resistor itself adds only 4.1 nV/√Hz, and the kT/C noise of 10 nF is 0.64 µV.
-- The ESP32's sampling capacitor (a few pF) would disturb the 10 nF by only about 0.05 %.
+- The resistor itself adds only 1.3 nV/√Hz, and the kT/C noise of 100 nF is 0.20 µV.
+- When the ADC switches to this pin from one up to 3 V away, its sampling capacitor (assumed 5 pF) disturbs the 100 nF by about 0.15 mV. With 1 kΩ and 10 nF (the same corner) it would be 1.5 mV, about 2 LSB.
 
 Its corner is above $`f_s/2 = 5\,\text{kHz}`$, so it mainly limits noise. A filter that also stops *signals* above $`f_s/2`$ from aliasing needs a lower corner and a steeper roll-off. The ADS8681 path already has its 15 kHz filter inside the chip.
 
@@ -1162,6 +1271,26 @@ Oversampling and decimation apply the same idea in time. You sample at $`\text{O
 
 For repetitive signals, averaging successive triggered frames gives the same $`\sqrt{M}`$ gain without lowering the bandwidth, but only up to the trigger's timing jitter. The trigger is tested only at sample instants, so each frame is misaligned by a random fraction of one sample period ($`T/\sqrt{12} = 28.9\,\mu\text{s}`$ rms at 10 kS/s). Averaging then acts as a low-pass filter $`|\sin(\pi fT)/(\pi fT)|`$, which is −3 dB at $`0.44\,f_s`$ and −3.9 dB at $`f_s/2`$. Noise adds a further jitter $`\sigma_t = \sigma_v/|dv/dt|`$ at the crossing. For example, 1.65 mV of noise on a 1 V, 100 Hz sine gives 2.6 µs, much smaller than the sample-grid term.
 
+**Choosing the averaging window to reject mains hum.** Averaging is also a filter. The mean of $`n`$ samples spaced $`T`$ apart passes a tone of frequency $`f`$ with gain
+
+```math
+|H_\text{avg}(f)| = \left|\frac{\sin(\pi f nT)}{n\,\sin(\pi f T)}\right| \approx \left|\frac{\sin(\pi f T_w)}{\pi f T_w}\right|, \qquad T_w = nT
+```
+
+Its nulls sit at multiples of $`1/T_w`$. A 100 ms window holds exactly 5 cycles of 50 Hz and 6 cycles of 60 Hz, so it nulls both mains frequencies and all their harmonics. The default record (1000 samples at 10 kS/s) is exactly such a window, so the host's mean rejects hum. If the real sample rate is off by 1 %, about 1 % of the hum (−40 dB) gets through.
+
+CAL ZERO's 2048 reads are not paced, so its window is however long 2048 reads take: about 20 to 41 ms on the native paths, and roughly 15 ms on the ADS8681, whose reads are faster. The worst-case hum left in the mean is $`|H_\text{avg}|`$ times the hum amplitude:
+
+| Window | 50 Hz residual | 60 Hz residual |
+|---|---|---|
+| 15 ms (ADS8681) | 30 % | 11 % |
+| 20 ms | 0 | 16 % |
+| 30 ms | 21 % | 10 % |
+| 41 ms | 2.4 % | 13 % |
+| 100 ms | 0 | 0 |
+
+For example, 1 mV of hum picked up by the shorting lead could leave up to 0.21 mV in a native mid-point (about a quarter of an ESP32 LSB) and up to 0.3 mV in the ADS8681's (about 4 of its LSBs). Pacing CAL ZERO so that its 2048 samples span exactly 100 ms (20.48 kS/s) would null both mains frequencies on every path.
+
 #### T3.10 Noise and error budget per path (theoretical)
 
 All values below are design estimates referred to the probe ($`V_{\text{in}}`$), at 300 K, with the assumptions stated above. None of them are measured. Stage-1 values apply only if stage 1 is actually driven (see the Y3 note above). $`\sigma_{\text{ADC}}`$ is the ESP32 ADC's own noise, which is not documented. The last two rows use an optimistic value (2 LSB) and a pessimistic one (16 LSB, the unverified third-party ESP32 figure).
@@ -1183,6 +1312,33 @@ What the budget shows:
 - **Analog front end:** its noise is set mainly by the level shifter, the high-value stage resistors and the missing anti-aliasing filter, which lets tens of MHz of noise bandwidth alias into every sample.
 - **ADS8681:** this path is about 30 to 230 times quieter than the direct path, and 6 to 40 times quieter than stage 1. It has both a better converter and a 15 kHz filter that limits the noise bandwidth.
 
+#### T3.11 Comparing the three paths: SNR versus signal size
+
+Take a sine of amplitude $`A`$ on a path whose input-referred noise is $`\sigma_\text{in}`$ (the last rows of the budget table). Its signal-to-noise ratio, and the equivalent number of bits, are
+
+```math
+\text{SNR}(A) = 20\log_{10}\frac{A/\sqrt{2}}{\sigma_\text{in}}, \qquad \text{ENOB}(A) = \frac{\text{SNR}(A) - 1.76}{6.02}
+```
+
+Each path only carries signals up to its usable range (T1.4; ESP32-S3 linear range 0.10-3.00 V, smaller on a C3). Below, $`\sigma_\text{ADC}`$ is 2 LSB / 16 LSB, as in the budget:
+
+| Path | Largest usable amplitude (S3) | SNR at that amplitude | SNR for a 0.1 V sine |
+|---|---|---|---|
+| V2 direct | 1.35 V | 55.2 dB / 37.4 dB | 32.6 dB / 14.8 dB |
+| V1 stage 2 | 0.572 V | 54.6 dB / 37.4 dB | not driven below 0.275 V |
+| V1 stage 1 (if driven) | 0.245 V | 54.4 dB / 37.4 dB | 46.6 dB / 29.6 dB |
+| V3 ADS8681 | 1.65 V | 86.2 dB | 61.9 dB |
+
+Two results stand out:
+
+- **A gain stage does not widen its own path's dynamic range.** When the ESP32's noise dominates, a stage shrinks both the input range and the input-referred noise by $`G_b`$, so every native path reaches the same SNR at full range (37.4 dB in the pessimistic case). Auto-ranging pays off in *combined* dynamic range: the largest signal the direct path can carry, over the noise floor of the highest-gain stage. That is 69.2 dB (optimistic) or 52.2 dB (pessimistic), 14.0 to 14.8 dB more than the direct path and close to $`20\log_{10}G_1 = 14.8`$ dB. With stage 1 undriven, as drawn (T4.4), stage 2 sets the floor and the figures fall to 62.1 dB and 44.8 dB.
+
+```math
+\text{DR}_\text{AUTO} = 20\log_{10}\frac{A_{\max,\text{direct}}/\sqrt{2}}{\sigma_{\text{in},1}}
+```
+
+- **The ADS8681 wins at every amplitude.** At any given amplitude it is 29 to 47 dB ahead of the direct path, and its 86.2 dB dynamic range is still 17 to 34 dB more than the auto-ranged combination. That is the quantitative answer to the question the board was built to ask.
+
 ### T4. The math inside the firmware and the measurements
 
 The firmware and the Python host apply a short chain of algebra to every reading. They undo the analog front end to get probe volts back, decide which acquisition path to trust, line the samples up in time, and turn a record into readable numbers. This section derives each step from the schematic and plugs in this board's values. Every number here is a design or theory value, computed from the schematic, datasheets or a labelled assumption. None of them is a bench measurement.
@@ -1203,7 +1359,7 @@ V_{\text{in}} = \frac{V_{D2} - \text{mid}_{\text{direct}}}{g_{\text{direct}}}
 
 On this path the ESP32 ADC sets the limit, not the op-amp. If the ADC is trusted from 0.10 V to 3.00 V (the span the firmware uses as "linear" for the gain stages), the probe range is −1.55 V to +1.35 V. The ESP32-C3 is specified only up to about 2.5 V at its highest attenuation, which lowers the top end to about +0.85 V. `analogReadMilliVolts()` returns whole millivolts, and the raw 12-bit code step at this attenuation is somewhat finer (roughly range / 4096, about 0.6–0.8 mV), so the integer-millivolt output sets a 1 mV step at the probe.
 
-All the reconstructions return the voltage at RawInput itself. RawInput is loaded by R3 + R6 = 20 kΩ to the 1.65 V buffer (in parallel with the ADS8681's ≥ 1 MΩ to GND), so a source with internal resistance is pulled toward 1.65 V. For example, a 0 V source with 1 kΩ of internal resistance sits at about +79 mV. Calibrating with a stiff (low-impedance) source does not remove this.
+All the reconstructions return the voltage at RawInput itself. RawInput is loaded by R3 + R6 = 20 kΩ to the 1.65 V buffer (in parallel with the ADS8681's ≥ 1 MΩ to GND), so a source with internal resistance is pulled toward 1.65 V. For example, a 0 V source with 1 kΩ of internal resistance sits at about +80 mV. Calibrating with a stiff (low-impedance) source does not remove this.
 
 **External ADC (V3, ADS8681).** AIN_P is wired to RawInput itself, so there is no level shift to undo. Range code 0x4 selects ±0.625·VREF = ±2.56 V with straight-binary output, so 0 V reads as code 0x8000. With $`N = 16`$, the ideal transfer function the firmware assumes, and its inverse, are:
 
@@ -1282,12 +1438,12 @@ These gains were sized for the website's windows. The redone ±0.275 V window is
 
 The ESP32 ADC does not span 0–3.3 V, so the stages clip in the ADC before they reach the rails. The stages invert, so negative inputs drive the outputs high. The bias of 1.65 V is closer to the top of the ADC range than to the bottom, so the upper limit is reached first. Within the firmware's linear window of 0.10–3.00 V, the stages at their ideal gains are usable over these ranges:
 
-| Stage | Usable $`V_{\text{in}}`$ for a 0.10–3.00 V reading | Negative limit with the ESP32-C3's 2.5 V ceiling |
+| Stage | Usable $`V_{\text{in}}`$ for a 0.10–3.00 V reading | Negative limit on a C3 (firmware limit 2.45 V) |
 |---|---|---|
-| 1 ($`G_1 = 5.5`$) | −0.245 V to +0.282 V | −0.155 V |
-| 2 ($`G_2 = 2.36`$) | −0.572 V to +0.657 V | −0.360 V |
+| 1 ($`G_1 = 5.5`$) | −0.245 V to +0.275 V (window edge; the ADC alone would allow +0.282 V) | −0.145 V |
+| 2 ($`G_2 = 2.36`$) | −0.572 V to +0.657 V | −0.339 V |
 
-Covering all of ±0.275 V inside 0.10–3.00 V would need $`G_1 \le 1.35/0.275 = 4.9`$, or 3.1 under the C3's 2.5 V ceiling. Beyond these limits the firmware rejects the stage reading and falls through to the next path (T4.5).
+Covering all of ±0.275 V inside 0.10–3.00 V would need $`G_1 \le 1.35/0.275 = 4.9`$, or 2.9 under the C3's 2.45 V limit. Beyond these limits the firmware rejects the stage reading and falls through to the next path (T4.5).
 
 #### T4.4 The window logic as Boolean algebra
 
@@ -1329,26 +1485,26 @@ The XIAO cannot see $`S_A`$, $`S_B`$ or MUXEN, so the firmware decides which sta
 
 1. Read D2 to get $`x_0`$ (slot 0).
 2. Read every enabled stage, highest $`|g_b|`$ first: stage 1 in slot 1, stage 2 in slot 2.
-3. Read D2 again to get $`x_1`$ (slot $`m`$, here 3).
-4. For each stage in that order, take the direct reading interpolated to the stage's own slot $`k`$, $`x_k = x_0 + (x_1 - x_0)\,k/m`$, and accept the stage if all of these hold:
+3. Read D2 again to get $`x_1`$ (slot $`m_s`$, here 3).
+4. For each stage in that order, take the direct reading interpolated to the stage's own slot $`k`$, $`x_k = x_0 + (x_1 - x_0)\,k/m_s`$, and accept the stage if all of these hold:
     - $`x_k`$ lies in the stage's window $`[\text{lo}_b - 0.05,\ \text{hi}_b + 0.05]`$ V and not inside its hole (below);
     - $`y_b`$ lies within the ADC's linear range, 0.10-3.00 V (2.45 V on a C3);
     - $`y_b`$ is not at the idle level, $`|y_b - \text{idle}| \ge 0.1`$ V, unless CAL BANDS has confirmed that the stage is driven on both sides of its idle point;
     - the reconstruction agrees with the direct path:
 
 ```math
-\left|\, \frac{y_b - \text{off}_b}{g_b} - \left(x_0 + (x_1 - x_0)\,\frac{k}{m}\right) \right| \le 0.04\,\text{V}
+\left|\, \frac{y_b - \text{off}_b}{g_b} - \left(x_0 + (x_1 - x_0)\,\frac{k}{m_s}\right) \right| \le 0.04\,\text{V}
 ```
 
 The first accepted stage supplies the output, with band 1 or 2. If no stage is accepted, the output is $`x_0`$, with band 0.
 
-**Why interpolate the direct reads.** The conversions happen one after another, roughly $`\delta`$ apart, so the stage in slot $`k`$ samples the signal at $`t_0 + k\delta`$ while the two D2 reads bracket it at $`t_0`$ and $`t_0 + m\delta`$. Linear interpolation between them is exact for any straight-line signal. For a curved one the error is the standard interpolation remainder:
+**Why interpolate the direct reads.** The conversions happen one after another, roughly $`\delta`$ apart, so the stage in slot $`k`$ samples the signal at $`t_0 + k\delta`$ while the two D2 reads bracket it at $`t_0`$ and $`t_0 + m_s\delta`$. Linear interpolation between them is exact for any straight-line signal. For a curved one the error is the standard interpolation remainder:
 
 ```math
-x_k - x(t_0 + k\delta) = \frac{k\,(m-k)}{2}\,\delta^2\,\ddot x(\xi), \qquad t_0 < \xi < t_0 + m\delta
+x_k - x(t_0 + k\delta) = \frac{k\,(m_s-k)}{2}\,\delta^2\,\ddot x(\xi), \qquad t_0 < \xi < t_0 + m_s\delta
 ```
 
-For a sine of peak amplitude $`V_p`$ and angular frequency $`\omega`$, the worst-case mismatch therefore falls from $`V_p\omega k\delta`$ (comparing with $`x_0`$ alone) to $`k(m-k)V_p\omega^2\delta^2/2`$. With $`m = 3`$, both slots have $`k(m-k) = 2`$. Take $`\delta = 15\,\mu\text{s}`$ (assumed, from the 10-20 µs per read), $`V_p`$ = 0.5 V and 1 kHz. Comparing with $`x_0`$ alone would give 47 mV for stage 1 and 94 mV for stage 2, both beyond the 40 mV tolerance. With interpolation both are 4.4 mV. At this amplitude the tolerance is reached at 849 Hz (stage 1) or 424 Hz (stage 2) without interpolation, and at about 3.0 kHz with it.
+For a sine of peak amplitude $`V_p`$ and angular frequency $`\omega`$, the worst-case mismatch therefore falls from $`V_p\omega k\delta`$ (comparing with $`x_0`$ alone) to $`k(m_s-k)V_p\omega^2\delta^2/2`$. With $`m_s = 3`$, both slots have $`k(m_s-k) = 2`$. Take $`\delta = 15\,\mu\text{s}`$ (assumed, from the 10-20 µs per read), $`V_p`$ = 0.5 V and 1 kHz. Comparing with $`x_0`$ alone would give 47 mV for stage 1 and 94 mV for stage 2, both beyond the 40 mV tolerance. With interpolation both are 4.4 mV. At this amplitude the tolerance is reached at 849 Hz (stage 1) or 424 Hz (stage 2) without interpolation, and at about 3.0 kHz with it.
 
 **Why the test is robust to the Y3 problem.** Every sample falls into one of three cases:
 
@@ -1386,7 +1542,7 @@ Here $`S_x = \sum x_i`$, $`S_y = \sum y_i`$, $`S_{xx} = \sum x_i^2`$, $`S_{xy} =
 g = \frac{m\,S_{xy} - S_x S_y}{m\,S_{xx} - S_x^2}, \qquad \text{off} = \frac{S_y - g\,S_x}{m}, \qquad \sigma_r = \sqrt{\frac{S_{yy} - \text{off}\,S_y - g\,S_{xy}}{m}}
 ```
 
-$`\sigma_r`$ is the RMS residual; the identity under its square root holds only at the optimum. Dividing $`\sigma_r`$ by $`|g|`$ gives the fit error referred to the input. A second pass refits without points more than $`3\sigma_r`$ from the line, which removes samples caught mid-switch. The learned window is $`[\min x_i, \max x_i]`$ over the active samples. A stage with fewer than 100 active samples is reported as never driven and disabled. On the board as drawn, that is exactly what stage 1 should report (T4.4).
+$`\sigma_r`$ is the RMS residual; the identity under its square root holds only at the optimum. Dividing $`\sigma_r`$ by $`|g|`$ gives the fit error referred to the input. A second pass refits without points more than $`3\sigma_r`$ from the line, which removes samples caught mid-switch. The learned window is $`[\min x_i, \max x_i]`$ over the active samples. CAL BANDS takes 4000 samples at 2 kS/s (2 s). A stage with fewer than 100 active samples is reported as never driven and disabled; one with enough samples but less than 0.1 V of input span keeps its previous calibration. On the board as drawn, that is exactly what stage 1 should report (T4.4).
 
 **Finding the hole.** The fit predicts where a driven stage should read, $`\hat y_i = \text{off} + g\,x_i`$. A sample inside the learned window that reads idle, $`|y_i - \text{idle}| < 0.1`$ V, although the fit puts it well away from idle, $`|\hat y_i - \text{idle}| > 0.2`$ V, can only come from an input where the mux is not driving the stage. The hole is the range of those inputs, if there are at least five. For stage 2 with nested windows, that is window 1. The stage counts as driven around its idle point ("trusted near idle", T4.5) when active samples lie on both sides of $`x_{0,b}`$ and $`x_{0,b}`$ is not in a hole. This test looks only at samples that contradict the fit. Inferring holes from gaps between active samples instead would give false holes whenever the sweep frequency divides the 2 kS/s sampling rate, because the samples then land on the same few input values every cycle.
 
@@ -1409,7 +1565,7 @@ A false trigger now needs one sample below $`L - h`$ and a later one at or above
 P_{\text{false, per pair}} \le Q\!\left(\frac{h}{2\sigma}\right)^{2}
 ```
 
-$`Q`$ is the Gaussian tail probability. With the default $`h`$ = 30 mV and an assumed $`\sigma`$ = 5 mV, the bound is $`Q(3)^2 \approx 1.8\times10^{-6}`$. At $`\sigma`$ = 10 mV it rises to $`4.5\times10^{-3}`$, and without hysteresis it is 1/4. A fast edge crosses the band in a sample or two and offers few such pairs. A slow or flat signal parked inside the band offers many, and it will eventually false-trigger. Keep $`h \gtrsim 6\sigma`$ and set $`L`$ away from flat parts of the waveform. The cost is that a signal must dip at least $`h`$ below $`L`$ before it can trigger at all.
+$`Q`$ is the Gaussian tail probability. With the default $`h`$ = 30 mV and an assumed $`\sigma`$ = 5 mV, the bound is $`Q(3)^2 \approx 1.8\times10^{-6}`$. At $`\sigma`$ = 10 mV it rises to $`4.5\times10^{-3}`$, and without hysteresis it is 1/4. A fast edge crosses the band in a sample or two and offers few such pairs. A slow or flat signal parked inside the band offers many, and it will eventually false-trigger. Keep $`h`$ above about $`6.6\sigma`$ (the rule of T3.8), which for the default 30 mV means noise below about 4.5 mV rms, and set $`L`$ away from flat parts of the waveform. The cost is that a signal must dip at least $`h`$ below $`L`$ before it can trigger at all.
 
 The trigger fires on the first sample at or above $`L`$, without interpolation. For a signal unrelated to the sample clock, the displayed trigger point therefore jitters uniformly over one sample period, with rms $`T/\sqrt{12}`$ = 28.9 µs at 10 kS/s. The level $`L`$ is in reconstructed probe volts (default 0 V). The trigger modes are FREE (no trigger), AUTO (sends an untriggered record if no trigger arrives in time), NORMAL (waits for a trigger) and SINGLE (one triggered record, then stop).
 
@@ -1439,7 +1595,7 @@ The 1 µs timestamp resolution contributes about 10 ppm over a 99.9 ms record. T
 \text{stored}[k] = \big(\,y_{\text{native}}[k-1],\ y_{\text{ads}}[k]\,\big), \qquad y_{\text{ads}}[k] = Q_{16}\!\left(V_{\text{in}}(t_{\text{CS},k-1})\right)
 ```
 
-Here $`Q_{16}`$ is the 16-bit quantizer of T4.1. What remains is the short gap between the CS edge and the first native read in the same tick, at most about one read time $`\delta`$.
+Here $`Q_{16}`$ is the 16-bit quantizer of T4.1. What remains is the short gap between the CS edge and the first native read in the same tick, at most about one read time $`\delta`$. On top of that, the EXT signal lags by the group delay of the ADS8681's internal filter, about 14 µs at low frequency (T1.5), which no sample alignment removes.
 
 #### T4.10 Host measurements
 
@@ -1467,7 +1623,35 @@ As an example, take a 1 kHz sine of 0.5 V amplitude with an assumed $`\sigma_v`$
 
 Without noise, interpolation is very accurate at a sine's mid-level crossing, because the curvature there is zero. At 10 samples per cycle the error is at most 0.0065 samples (0.65 µs). In practice, error in $`f_s`$ (T4.9) and aliasing (there is no anti-aliasing filter ahead of the ESP32 pins) matter more than either effect.
 
-#### T4.11 CRC-16/CCITT-FALSE
+#### T4.11 AC coupling and duty cycle
+
+**Hardware AC coupling does not work on this input as it stands.** A series capacitor $`C`$ into the board's load (T1.6: $`R_L`$ = 19.6 kΩ to $`V_\text{th}`$ = 1.649 V) forms a high-pass filter:
+
+```math
+H(s) = \frac{sR_LC}{1 + sR_LC}, \qquad f_c = \frac{1}{2\pi R_L C} \quad (C = 1\,\mu\text{F} \Rightarrow f_c = 8.1\,\text{Hz})
+```
+
+But the capacitor also removes the DC path from the source, so RawInput settles to $`V_\text{th}`$ = 1.649 V, the top of the range, and the signal clips. A resistor $`R_g`$ to GND only pulls the operating point down to $`V_\text{th}R_g/(R_g + R_L)`$. Staying under 10 mV needs $`R_g \le`$ 120 Ω, which then loads the source through $`C`$. On this board, AC coupling belongs in software, or behind a buffer that has its own ground-referenced bias.
+
+**Software AC coupling.** Subtracting the record mean is exact for a whole number of cycles; it is the AC RMS of T4.10. For a live trace, a running first-order digital high-pass also works:
+
+```math
+y[k] = a\,\big(y[k-1] + x[k] - x[k-1]\big), \qquad a = \frac{\tau}{\tau + T}, \qquad f_c \approx \frac{1}{2\pi\tau} \quad (\tau \gg T)
+```
+
+Any high-pass tilts a square wave. Over a flat half-period $`t_h`$ the level decays by $`1 - e^{-t_h/\tau} \approx t_h/\tau`$. For 1 % tilt on a 10 Hz square wave ($`t_h`$ = 50 ms) that means $`\tau \ge`$ 5 s, or $`f_c \le`$ 0.032 Hz.
+
+**Duty cycle moves the baseline.** After AC coupling, a pulse train of height $`V`$ and duty cycle $`D`$ has zero mean, so it sits at $`(1 - D)V`$ and $`-DV`$. A rising trigger at $`L`$ = 0 V with hysteresis $`h`$ only re-arms if the low level goes below $`-h`$, that is if $`DV > h`$. With the default $`h`$ = 30 mV and $`V`$ = 1 V, pulses with $`D`$ < 3 % would never trigger. The firmware triggers on DC-coupled samples, so this only matters if AC coupling is ever moved into the firmware.
+
+**Measuring duty cycle.** Using the same interpolated mid-level crossings as T4.10, $`D = (t_\text{fall} - t_\text{rise})/P`$. For edges much faster than $`T`$, interpolation cannot help, and each edge is only known to within one sample period. Two independent uniform errors give, per cycle:
+
+```math
+\sigma_D = \frac{T}{\sqrt{6}\,P}
+```
+
+That is 4.1 percentage points for a 1 kHz square wave at 10 kS/s. Averaging $`K`$ cycles divides the error by $`\sqrt{K}`$ (0.41 points over 100 cycles), but only if the sample phase drifts from cycle to cycle. When $`f_s`$ is an exact multiple of $`f`$ the phases repeat, and the error becomes a fixed bias of up to $`T/P`$. The host does not compute duty cycle yet; this is what such a measurement would deliver.
+
+#### T4.12 CRC-16/CCITT-FALSE
 
 Each packet carries a 16-bit CRC over the type, version, length and payload fields; the A5 5A sync word is not covered. The CRC treats the bit string as a polynomial over GF(2), where coefficients are 0 or 1 and addition is XOR. The checksum is the remainder after dividing by a fixed generator polynomial:
 
@@ -1486,7 +1670,7 @@ $`M'(x)`$ is the message with its first 16 bits inverted. That inversion is the 
 | burst of exactly 17 bits | all but $`2^{-15} \approx 3.1\times10^{-5}`$ | standard CRC burst result |
 | longer bursts, random patterns | all but $`2^{-16} \approx 1.5\times10^{-5}`$ | one remainder in $`2^{16}`$ is zero |
 
-Within 32 767 bits (4093 data bytes plus the CRC), every 1-, 2- and 3-bit error is caught, which is a Hamming distance of 4. With the current packet layout (6 header bytes plus a 28-byte waveform header), a single-channel frame fits up to 1014 samples. The default 1000-sample single-channel frame covers 4034 bytes. An AUTO frame with band codes (5034 bytes) or a three-channel MODE ALL frame (13 034 bytes) is longer. In those, two flipped bits a multiple of 32 767 bits apart would pass undetected, and every other row of the table still holds. Python's `binascii.crc_hqx(data, 0xFFFF)` computes the same CRC, and the standard check string "123456789" gives 0x29B1.
+Within 32 767 bits (4093 data bytes plus the CRC), every 1-, 2- and 3-bit error is caught, which is a Hamming distance of 4. With the current packet layout (the 6 CRC-covered header bytes, type, version and length, plus a 28-byte waveform header; the A5 5A sync word is outside the CRC), a single-channel frame fits up to 1014 samples. The default 1000-sample single-channel frame covers 4034 bytes. An AUTO frame with band codes (5034 bytes) or a three-channel MODE ALL frame (13 034 bytes) is longer. In those, two flipped bits a multiple of 32 767 bits apart would pass undetected, and every other row of the table still holds. Python's `binascii.crc_hqx(data, 0xFFFF)` computes the same CRC, and the standard check string "123456789" gives 0x29B1.
 
 ### Sources
 
@@ -1502,10 +1686,10 @@ Datasheet and documentation values used in this chapter. Typical values are typi
 ## Limitations and notes
 
 - **Input range is ±1.65 V.** That's set by the level shifter. For bigger signals, add a compensated attenuator ([T1](#t1-laplace-transforms-and-the-analog-front-end)) and set `PGAIN` to match. This is a low-voltage instrument with no isolation, so **never connect it to mains**.
-- **Input impedance is about 20 kΩ to +1.65 V**, through R3 + R6, not the 1 MΩ of a bench scope. That loads high-impedance sources, and a floating input reads about +1.6 V ([T1](#t1-laplace-transforms-and-the-analog-front-end)).
+- **Input impedance is about 20 kΩ to +1.65 V**, through R3 + R6, not the 1 MΩ of a bench scope. That loads high-impedance sources (a 1 kΩ source at 0 V reads about +80 mV), and a floating input reads near the top of the range: about +1.65 V on the ADS8681, with the native paths saturated ([T1.6](#t16-input-loading-what-the-probe-tip-looks-like)). The front end survives about ±20 V while powered ([T1.10](#t110-input-protection-how-much-overvoltage-the-front-end-survives)); don't drive the input while the board is off.
 - **ESP32 ADC range.** Per Espressif's ADC documentation, the usable range at the highest attenuation is about 0–2.5 V on the ESP32-C3 and 0–3.1 V on the S3. The top of the 0–3.3 V level-shifted range therefore clips on the native-ADC paths (V1, V2), most noticeably on a C3. The firmware treats stage readings outside 0.10–3.00 V (2.45 V on a C3) as unusable. The ADS8681 path (V3) is not affected.
 - **No anti-aliasing filter on the native paths.** The V1/V2 analog bandwidth is MHz, set by the op-amps, so anything above f_s/2 aliases. The ADS8681 has its own ~15 kHz filter ([T2](#t2-sampling-from-laplace-to-the-z-transform-and-the-fft)).
-- **V1 timing.** Stage 1 is read one ADC conversion after the direct read and stage 2 two (≈ 10–40 µs), so on fast edges the V1 trace lags slightly and the lag steps when the band changes. That is a fixed time shift per band, not a gain error ([T2](#t2-sampling-from-laplace-to-the-z-transform-and-the-fft)).
+- **V1 timing.** Stage 1 is read one ADC conversion after the direct read and stage 2 two (≈ 10–40 µs), so on fast edges the V1 trace lags slightly and the lag steps when the band changes. That is a fixed time shift per band, not a gain error. The ADS8681's internal filter likewise delays V3 by about 14 µs ([T2](#t2-sampling-from-laplace-to-the-z-transform-and-the-fft)).
 - **Sample rate.** The native-ADC paths are limited by `analogReadMilliVolts()` (tens of kS/s, depending on the chip and core version). V1 needs four ADC reads per sample, so `MODE AUTO` and `MODE ALL` top out around 11–22 kS/s, against roughly 44–89 kS/s for DIRECT alone ([T4.9](#t49-sample-timing-pacing-measured-rate-and-ads8681-alignment)). Request any rate: if the hardware can't keep up, the firmware runs at the fastest rate it can sustain, keeps the samples evenly spaced, and reports that rate. Interrupts (USB, RTOS tick) add a few µs of sampling jitter.
 - **What has been tested.** The firmware compiles for every XIAO variant. It was also run on a PC against a simulated board built from the schematic: inverting gain stages with a mismatched mid-rail, nested windows with both mux wirings, and an ADS8681 model with register map and one-frame latency. In that simulation `CAL BANDS` recovered the stage gains to within 0.1 %. **It has not been run on the real PCB yet**, so use `PROBE` and the calibration steps before trusting measurements.
 
