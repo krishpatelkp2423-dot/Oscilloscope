@@ -36,7 +36,7 @@ struct __attribute__((packed)) WaveformHeader {
   uint8_t mode;          // Mode enum (scope.h)
   uint8_t nch;           // number of channel arrays that follow
   uint8_t flags;         // WaveformFlags
-  uint8_t trig_src;      // channel id, or TRIG_SRC_HW
+  uint8_t trig_src;      // trigger source channel id (ChannelId)
   uint32_t nsamples;     // samples per channel
   int32_t trig_index;    // sample index of the trigger, -1 if none
   float sample_rate;     // measured sample rate in Hz

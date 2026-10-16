@@ -42,7 +42,7 @@ class DemoLink:
     """Stands in for ScopeLink without hardware. Frames are encoded and parsed
     with the real protocol code, so the demo exercises the same data path."""
 
-    BAND_GAIN = {0: 1.0, 2: 2.0, 3: 6.0}
+    BAND_GAIN = {0: 1.0, 1: 5.5, 2: 2.36}  # 0: direct, 1: stage 1, 2: stage 2
 
     def __init__(self) -> None:
         self.waveforms: queue.Queue[Waveform] = queue.Queue(maxsize=8)
@@ -101,7 +101,7 @@ class DemoLink:
             phase = np.pi - phase
         t = (np.arange(n) - (pre if triggered else 0)) / fs
         sig = amp * np.sin(2 * np.pi * 1000 * t + phase)
-        bands = np.where(np.abs(sig) < 0.275, 3, np.where(np.abs(sig) < 0.825, 2, 0)).astype(np.uint8)
+        bands = np.where(np.abs(sig) < 0.275, 1, np.where(np.abs(sig) < 0.70, 2, 0)).astype(np.uint8)
         gain = np.vectorize(self.BAND_GAIN.get)(bands)
         paths = {
             "AUTO": sig + self._rng.normal(0, 0.004, n) / gain,
@@ -169,10 +169,10 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.band_plot = plots.addPlot(row=1, col=0)
         self.band_plot.setMaximumHeight(120)
         self.band_plot.setXLink(self.plot)
-        self.band_plot.setLabel("left", "Band")
+        self.band_plot.setLabel("left", "V1 path")
         self.band_plot.setLabel("bottom", units="s")
-        self.band_plot.setYRange(-0.3, 3.3)
-        self.band_plot.getAxis("left").setTicks([[(i, str(i)) for i in range(4)]])
+        self.band_plot.setYRange(-0.3, 2.3)
+        self.band_plot.getAxis("left").setTicks([[(0, "×1"), (1, "S1"), (2, "S2")]])
         self.band_curve = self.band_plot.plot(pen=pg.mkPen(COLORS["AUTO"]), stepMode="center")
         return plots
 
@@ -194,7 +194,7 @@ class ScopeWindow(QtWidgets.QMainWindow):
         form.addRow("Trigger mode", self.trig)
         self.edge = self._combo(["RISING", "FALLING"], lambda s: f"EDGE {s}")
         form.addRow("Edge", self.edge)
-        self.src = self._combo(["DIRECT", "AUTO", "EXT", "HW"], lambda s: f"SRC {s}")
+        self.src = self._combo(["DIRECT", "AUTO", "EXT"], lambda s: f"SRC {s}")
         form.addRow("Trigger source", self.src)
         self.level = QtWidgets.QDoubleSpinBox(decimals=3, minimum=-15, maximum=15, singleStep=0.05,
                                               suffix=" V", keyboardTracking=False)

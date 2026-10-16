@@ -27,7 +27,7 @@ def main() -> int:
     p.add_argument("--n", type=int, default=1000, help="samples per frame")
     p.add_argument("--trig", default="AUTO", choices=["AUTO", "NORMAL", "FREE"])
     p.add_argument("--edge", default="RISING", choices=["RISING", "FALLING"])
-    p.add_argument("--src", default="DIRECT", choices=["AUTO", "DIRECT", "EXT", "HW"])
+    p.add_argument("--src", default="DIRECT", choices=["AUTO", "DIRECT", "EXT"])
     p.add_argument("--level", type=float, default=0.0, help="trigger level in volts")
     p.add_argument("--pre", type=int, default=25, help="pre-trigger percent")
     p.add_argument("--frames", type=int, default=1)
